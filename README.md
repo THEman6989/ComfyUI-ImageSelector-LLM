@@ -1,189 +1,134 @@
-# ComfyUI OpenAI Compatible LLM Node
+# ComfyUI LLM Image Selector
 
-A ComfyUI custom node that provides integration with OpenAI-compatible Large Language Model APIs, including OpenAI, local models, and other compatible endpoints. Supports both text-only and multimodal (text + image) interactions.
+ComfyUI custom nodes for OpenAI-compatible chat/completions endpoints.
 
-## Features
+The main node in this fork is **LLM Image Selector**. It sends labelled contact sheets of candidate images to a vision-capable LLM and asks the model to score which candidate best matches a prompt, reference image, or sampled reference video frames.
 
-- **Multi-line prompt input**: Large text area for complex prompts
-- **Image input support**: Optional image input for multimodal LLMs (GPT-4 Vision, etc.)
-- **Configurable endpoint**: Support for OpenAI API and other compatible services
-- **Secure token input**: API key/token field for authentication
-- **Model selection**: Specify which model to use (defaults to vision-capable model)
-- **Generation parameters**: Control max tokens, temperature, and image detail level
-- **Automatic image encoding**: Converts ComfyUI images to base64 for API compatibility
-- **Error handling**: Comprehensive error reporting and fallback responses
+The original **OpenAI Compatible LLM** node is still registered for backward compatibility.
 
 ## Installation
 
-### Method 1: ComfyUI Manager (Recommended)
+Clone this repository into `ComfyUI/custom_nodes`:
 
-1. Install [ComfyUI Manager](https://github.com/ltdrdata/ComfyUI-Manager) if you haven't already
-2. Open ComfyUI Manager in your ComfyUI interface
-3. Search for "OpenAI Compatible LLM Node"
-4. Click Install
+```bash
+cd /path/to/ComfyUI/custom_nodes
+git clone https://github.com/THEman6989/ComfyUI-ImageSelector-LLM.git
+cd ComfyUI-ImageSelector-LLM
+pip install -r requirements.txt
+```
 
-### Method 2: Manual Installation
+Restart ComfyUI after installation.
 
-1. Navigate to your ComfyUI installation directory:
-   ```bash
-   cd /path/to/your/ComfyUI
-   ```
+## Nodes
 
-2. Clone this repository into the custom_nodes directory:
-   ```bash
-   cd custom_nodes
-   git clone https://github.com/yourusername/ComfyUI-OpenAI-Compat-LLM-Node.git
-   ```
+### LLM Image Selector
 
-3. Install the required dependencies:
-   ```bash
-   cd ComfyUI-OpenAI-Compat-LLM-Node
-   pip install -r requirements.txt
-   ```
+Category: `LLM/Image Selection`
 
-4. Restart ComfyUI
+Inputs:
 
-### Method 3: Direct Download
+| Input | Type | Description |
+| --- | --- | --- |
+| `prompt` | STRING | Multiline instructions for how candidates should be judged. |
+| `endpoint` | STRING | OpenAI-compatible `/v1/chat/completions` endpoint. |
+| `api_token` | STRING | Bearer token. Leave empty for local servers that do not require auth. |
+| `model` | STRING | Model name sent in the request body. |
+| `candidate_images` | IMAGE | ComfyUI image batch `[B,H,W,C]`; each batch item is one candidate. |
+| `max_images_per_call` | INT | Number of candidates per LLM request. Default `8`. |
+| `max_tokens` | INT | Maximum response tokens. Default `1024`. |
+| `temperature` | FLOAT | Sampling temperature. Default `0.0` for stable scoring. |
+| `timeout` | INT | Request timeout in seconds. Default `120`. |
+| `grid_columns` | INT | Contact sheet column count. Default `4`. |
+| `add_id_labels` | BOOLEAN | Draw visible 1-based candidate IDs on the contact sheet. |
+| `return_descriptions` | BOOLEAN | Include model reasons in `scores_json`. |
+| `reference_image` | IMAGE | Optional reference image attached to every request. |
+| `reference_video` | IMAGE | Optional IMAGE batch treated as video frames; up to 6 frames are sampled. |
+| `system_prompt` | STRING | Optional judge/system instructions. |
 
-1. Download the latest release from the [releases page](https://github.com/yourusername/ComfyUI-OpenAI-Compat-LLM-Node/releases)
-2. Extract the archive to your `ComfyUI/custom_nodes/` directory
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Restart ComfyUI
+Outputs:
 
-## Usage
+| Output | Type | Meaning |
+| --- | --- | --- |
+| `best_image` | IMAGE | The original unlabelled candidate image selected by the LLM. |
+| `best_index` | INT | Zero-based index of the selected candidate. |
+| `best_score` | FLOAT | Best score from `0` to `100`. |
+| `scores_json` | STRING | Structured scores, including `zero_based_index` and `one_based_id`. |
+| `raw_response` | STRING | Raw model responses per chunk for debugging. |
 
-1. After installation, restart ComfyUI
-2. In the ComfyUI interface, right-click to add a new node
-3. Navigate to `LLM` → `OpenAI Compatible LLM`
-4. Configure the node with your settings:
-   - **Prompt**: Enter your text prompt (supports multi-line input)
-   - **Endpoint**: API endpoint URL (default: OpenAI's endpoint)
-   - **API Token**: Your API key/token
-   - **Image** (optional): Connect an image from another node for multimodal analysis
-   - **Model**: Model name (default: gpt-4-vision-preview for multimodal support)
-   - **Max Tokens**: Maximum response length (default: 150)
-   - **Temperature**: Creativity/randomness (0.0-2.0, default: 0.7)
-   - **Image Detail**: Quality level for image processing (low/high/auto, default: auto)
+### OpenAI Compatible LLM
 
-## Supported Endpoints
+Category: `LLM`
 
-This node works with any OpenAI-compatible API endpoint, including:
+This is the original text/image prompt node. It remains available as **OpenAI Compatible LLM**. If a batch of images is connected to this older node, the batch is now encoded as a contact sheet instead of silently using only the first image.
 
-- **OpenAI API**: `https://api.openai.com/v1/chat/completions`
-- **Local models** (via tools like ollama, text-generation-webui, etc.)
-- **Cloud providers** with OpenAI-compatible APIs
-- **Self-hosted solutions**
+## llama.cpp Endpoint Example
 
-## Configuration Examples
+Start a llama.cpp server with a vision-capable model and projector, then point the node at the local OpenAI-compatible endpoint:
 
-### OpenAI API (Text + Vision)
-- **Endpoint**: `https://api.openai.com/v1/chat/completions`
-- **Models**: 
-  - Text-only: `gpt-3.5-turbo`, `gpt-4`, `gpt-4-turbo`
-  - Vision: `gpt-4-vision-preview`, `gpt-4-turbo` (with vision)
-- **API Token**: Your OpenAI API key
+```bash
+llama-server \
+  -m /path/to/model.gguf \
+  --mmproj /path/to/mmproj.gguf \
+  --host 127.0.0.1 \
+  --port 8080
+```
 
-### Local Ollama (Vision Models)
-- **Endpoint**: `http://localhost:11434/v1/chat/completions`
-- **Models**: 
-  - Text-only: `llama2`, `mistral`, `codellama`
-  - Vision: `llava`, `bakllava`, `llava-llama3`
-- **API Token**: Leave empty for local usage
+Node settings:
 
-### Text Generation WebUI (with MultiModal)
-- **Endpoint**: `http://localhost:5000/v1/chat/completions`
-- **Model**: Your loaded vision-capable model
-- **API Token**: Set if authentication is enabled
+```text
+endpoint: http://127.0.0.1:8080/v1/chat/completions
+api_token:
+model: local-model
+temperature: 0.0
+```
 
-## Usage Examples
+Leave `api_token` empty unless your server requires authentication.
 
-### Text-Only Generation
-1. Add the node to your workflow
-2. Set your prompt: "Explain the concept of machine learning"
-3. Leave the image input disconnected
-4. Use a text model like `gpt-3.5-turbo`
+## Visual Scoring, Not Tool Calling
 
-### Image Analysis
-1. Connect an image output from another node to the image input
-2. Set your prompt: "Describe what you see in this image"
-3. Use a vision model like `gpt-4-vision-preview`
-4. Adjust image detail level as needed
+This node does not use real OpenAI tool/function calling. It uses normal multimodal chat content: text plus base64 PNG `image_url` parts. The model is instructed to return strict JSON with candidate scores. The node parses that JSON and routes the selected image through the `best_image` output.
 
-### Image + Text Prompt
-1. Connect an image and set a specific prompt
-2. Example: "What colors are prominent in this image and how do they affect the mood?"
-3. The model will analyze both the text and image together
+Because the final choice is model-generated visual scoring, quality depends on the vision model, prompt clarity, and image layout.
+
+## Example Prompt For Outfit Matching
+
+```text
+Choose the candidate whose outfit best matches the reference.
+Focus on jacket shape, shirt color, pants/skirt color, shoes, accessories,
+patterns, and overall silhouette. Ignore pose, camera angle, background,
+lighting, facial expression, and image quality.
+```
+
+## Chunking With max_images_per_call
+
+`candidate_images` is a ComfyUI IMAGE batch shaped `[B,H,W,C]`. The selector preserves every candidate in the batch, adds optional visible labels `1`, `2`, `3`, and builds contact sheet grids.
+
+If the batch is larger than `max_images_per_call`, the node sends multiple requests internally. For example, `B=20` and `max_images_per_call=8` produces three calls: candidates `1-8`, `9-16`, and `17-20`. ComfyUI does not need a workflow loop for this.
+
+Scores are merged by global candidate ID. The returned `best_index` is zero-based for programmatic use, while `scores_json` also includes the visible one-based IDs used in the contact sheets.
+
+## JSON Response Expected From The Model
+
+The prompt asks the model to return only:
+
+```json
+{
+  "candidates": [
+    {"id": 1, "score": 0, "reason": "short reason"},
+    {"id": 2, "score": 100, "reason": "short reason"}
+  ],
+  "best_id": 2
+}
+```
+
+The parser tolerates markdown fences or extra surrounding text by extracting the first valid JSON object. If one chunk fails, the node records that raw response and continues with other chunks when possible. If every chunk fails, it raises a clear exception.
 
 ## Requirements
 
 - ComfyUI
 - Python 3.8+
-- requests >= 2.32.3
-- Pillow >= 10.0.0
-- numpy >= 1.24.0
+- requests
+- Pillow
+- numpy
 
-## Node Inputs
-
-| Input | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| prompt | STRING | Yes | "You are a helpful assistant." | The text prompt to send to the LLM |
-| endpoint | STRING | Yes | "https://api.openai.com/v1/chat/completions" | API endpoint URL |
-| api_token | STRING | Yes | "" | API authentication token |
-| image | IMAGE | No | None | Optional image input for multimodal analysis |
-| model | STRING | No | "gpt-4-vision-preview" | Model name to use (vision-capable by default) |
-| max_tokens | INT | No | 150 | Maximum tokens in response |
-| temperature | FLOAT | No | 0.7 | Sampling temperature (0.0-2.0) |
-| image_detail | STRING | No | "auto" | Image processing detail level (low/high/auto) |
-
-## Node Outputs
-
-| Output | Type | Description |
-|--------|------|-------------|
-| response | STRING | The generated text response from the LLM |
-
-## Error Handling
-
-The node includes comprehensive error handling:
-- Network connection errors
-- API authentication failures
-- Invalid JSON responses
-- Rate limiting and timeout issues
-- Missing response content
-
-Errors are returned as descriptive text strings for debugging.
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Add tests if applicable
-5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## Support
-
-- For issues and feature requests: [GitHub Issues](https://github.com/yourusername/ComfyUI-OpenAI-Compat-LLM-Node/issues)
-- For discussions: [GitHub Discussions](https://github.com/yourusername/ComfyUI-OpenAI-Compat-LLM-Node/discussions)
-
-## Changelog
-
-### v1.1.0
-- Added image input support for multimodal LLMs
-- Automatic base64 image encoding
-- Support for GPT-4 Vision and other vision models
-- Image detail level control
-- Updated dependencies (Pillow, numpy)
-
-### v1.0.0
-- Initial release
-- Basic OpenAI-compatible API integration
-- Multi-line prompt support
-- Configurable endpoints and models
-- Comprehensive error handling
+No heavy extra dependencies are required; ComfyUI already provides the tensor objects used for IMAGE values.
