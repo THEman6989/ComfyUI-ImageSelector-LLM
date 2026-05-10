@@ -33,7 +33,9 @@ Inputs:
 | `endpoint` | STRING | OpenAI-compatible `/v1/chat/completions` endpoint. |
 | `api_token` | STRING | Bearer token. Leave empty for local servers that do not require auth. |
 | `model` | STRING | Model name sent in the request body. |
-| `candidate_images` | IMAGE | ComfyUI image batch `[B,H,W,C]`; each batch item is one candidate. |
+| `candidate_directory` | STRING | Optional folder path. Every supported image file in the folder becomes a candidate. |
+| `recursive_directory` | BOOLEAN | Also load images from subfolders when `candidate_directory` is set. |
+| `candidate_images` | IMAGE | Optional ComfyUI image batch `[B,H,W,C]`; each batch item is one candidate. |
 | `max_images_per_call` | INT | Number of candidates per LLM request. Default `8`. |
 | `max_tokens` | INT | Maximum response tokens. Default `1024`. |
 | `temperature` | FLOAT | Sampling temperature. Default `0.0` for stable scoring. |
@@ -101,11 +103,13 @@ lighting, facial expression, and image quality.
 
 ## Chunking With max_images_per_call
 
+Candidates can come from `candidate_directory`, `candidate_images`, or both. Directory files are loaded first, sorted by path, then any connected ComfyUI IMAGE batch is appended. Supported file extensions are `bmp`, `gif`, `jpg`, `jpeg`, `png`, `tif`, `tiff`, and `webp`.
+
 `candidate_images` is a ComfyUI IMAGE batch shaped `[B,H,W,C]`. The selector preserves every candidate in the batch, adds optional visible labels `1`, `2`, `3`, and builds contact sheet grids.
 
-If the batch is larger than `max_images_per_call`, the node sends multiple requests internally. For example, `B=20` and `max_images_per_call=8` produces three calls: candidates `1-8`, `9-16`, and `17-20`. ComfyUI does not need a workflow loop for this.
+If the candidate set is larger than `max_images_per_call`, the node sends multiple requests internally. For example, 20 candidates and `max_images_per_call=8` produces three calls: candidates `1-8`, `9-16`, and `17-20`. ComfyUI does not need a workflow loop for this.
 
-Scores are merged by global candidate ID. The returned `best_index` is zero-based for programmatic use, while `scores_json` also includes the visible one-based IDs used in the contact sheets.
+Scores are merged by global candidate ID. The returned `best_index` is zero-based for programmatic use, while `scores_json` also includes the visible one-based IDs used in the contact sheets. For directory candidates, `scores_json` includes the original file path in each candidate `source`.
 
 ## JSON Response Expected From The Model
 

@@ -2,10 +2,11 @@ import base64
 import io
 import json
 import math
+from pathlib import Path
 
 import numpy as np
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 
 DEFAULT_SELECTOR_SYSTEM_PROMPT = (
@@ -14,6 +15,16 @@ DEFAULT_SELECTOR_SYSTEM_PROMPT = (
     "visible accessories, and overall outfit. Ignore background, lighting, pose, "
     "camera angle, and image quality. Return only valid JSON."
 )
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".tif",
+    ".tiff",
+    ".webp",
+}
 
 
 def _tensor_to_numpy(image_tensor):
@@ -73,6 +84,58 @@ def _image_batch_to_pil_images(image_tensor):
         )
 
     return [_image_array_to_pil(image_array[index]) for index in range(image_array.shape[0])]
+
+
+def _pil_image_to_comfy_image(image):
+    """Convert a PIL image to a ComfyUI IMAGE batch shaped [1,H,W,C]."""
+    image_array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    image_array = np.expand_dims(image_array, axis=0)
+
+    try:
+        import torch
+
+        return torch.from_numpy(image_array)
+    except Exception:
+        return image_array
+
+
+def _load_images_from_directory(directory, recursive=False):
+    """Load every supported image file from a directory as RGB PIL images."""
+    directory = str(directory or "").strip()
+    if not directory:
+        return [], []
+
+    root = Path(directory).expanduser()
+    if not root.exists():
+        raise ValueError(f"candidate_directory does not exist: {root}")
+    if not root.is_dir():
+        raise ValueError(f"candidate_directory is not a directory: {root}")
+
+    iterator = root.rglob("*") if recursive else root.iterdir()
+    image_paths = sorted(
+        path
+        for path in iterator
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    )
+
+    images = []
+    loaded_paths = []
+    errors = []
+    for path in image_paths:
+        try:
+            with Image.open(path) as image:
+                images.append(ImageOps.exif_transpose(image).convert("RGB").copy())
+            loaded_paths.append(str(path))
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+
+    if image_paths and not images:
+        raise ValueError(
+            "candidate_directory contains image files, but none could be loaded: "
+            + "; ".join(errors[:5])
+        )
+
+    return images, loaded_paths
 
 
 def _load_label_font():
@@ -303,7 +366,14 @@ class LLMImageSelectorNode:
                     "default": "local-model",
                     "placeholder": "Model name"
                 }),
-                "candidate_images": ("IMAGE",),
+                "candidate_directory": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "/path/to/candidate/images"
+                }),
+                "recursive_directory": ("BOOLEAN", {
+                    "default": False
+                }),
                 "max_images_per_call": ("INT", {
                     "default": 8,
                     "min": 1,
@@ -342,6 +412,7 @@ class LLMImageSelectorNode:
                 }),
             },
             "optional": {
+                "candidate_images": ("IMAGE",),
                 "reference_image": ("IMAGE",),
                 "reference_video": ("IMAGE",),
                 "system_prompt": ("STRING", {
@@ -450,12 +521,43 @@ class LLMImageSelectorNode:
         response.raise_for_status()
         return _extract_choice_content(response.json())
 
-    def _select_original_candidate(self, candidate_images, zero_index):
-        if len(candidate_images.shape) == 4:
-            return candidate_images[zero_index:zero_index + 1]
-        if hasattr(candidate_images, "unsqueeze"):
-            return candidate_images.unsqueeze(0)
-        return np.expand_dims(candidate_images, axis=0)
+    def _collect_candidate_images(self, candidate_directory, recursive_directory, candidate_images):
+        candidate_pil_images = []
+        candidate_sources = []
+
+        directory_images, directory_paths = _load_images_from_directory(
+            candidate_directory,
+            recursive=recursive_directory,
+        )
+        for image, path in zip(directory_images, directory_paths):
+            candidate_sources.append({
+                "type": "directory",
+                "path": path,
+            })
+            candidate_pil_images.append(image)
+
+        if candidate_images is not None:
+            batch_images = _image_batch_to_pil_images(candidate_images)
+            for batch_index, image in enumerate(batch_images):
+                candidate_sources.append({
+                    "type": "input_batch",
+                    "batch_index": batch_index,
+                })
+                candidate_pil_images.append(image)
+
+        return candidate_pil_images, candidate_sources
+
+    def _select_original_candidate(self, candidate_images, candidate_pil_images, candidate_sources, zero_index):
+        source = candidate_sources[zero_index]
+        if source["type"] == "input_batch" and candidate_images is not None:
+            batch_index = source["batch_index"]
+            if len(candidate_images.shape) == 4:
+                return candidate_images[batch_index:batch_index + 1]
+            if hasattr(candidate_images, "unsqueeze"):
+                return candidate_images.unsqueeze(0)
+            return np.expand_dims(candidate_images, axis=0)
+
+        return _pil_image_to_comfy_image(candidate_pil_images[zero_index])
 
     def select_image(
         self,
@@ -463,7 +565,8 @@ class LLMImageSelectorNode:
         endpoint,
         api_token,
         model,
-        candidate_images,
+        candidate_directory,
+        recursive_directory,
         max_images_per_call,
         max_tokens,
         temperature,
@@ -471,13 +574,20 @@ class LLMImageSelectorNode:
         grid_columns,
         add_id_labels,
         return_descriptions,
+        candidate_images=None,
         reference_image=None,
         reference_video=None,
         system_prompt=DEFAULT_SELECTOR_SYSTEM_PROMPT,
     ):
-        candidate_pil_images = _image_batch_to_pil_images(candidate_images)
+        candidate_pil_images, candidate_sources = self._collect_candidate_images(
+            candidate_directory=candidate_directory,
+            recursive_directory=recursive_directory,
+            candidate_images=candidate_images,
+        )
         if not candidate_pil_images:
-            raise ValueError("candidate_images does not contain any images")
+            raise ValueError(
+                "No candidate images found. Connect candidate_images, set candidate_directory, or use both."
+            )
 
         headers = self._headers(api_token)
         max_images_per_call = max(1, min(int(max_images_per_call), 32))
@@ -565,6 +675,7 @@ class LLMImageSelectorNode:
                         "zero_based_index": candidate_id - 1,
                         "score": score,
                         "reason": reason if return_descriptions else "",
+                        "source": candidate_sources[candidate_id - 1],
                     }
 
                 if not any(candidate_id in scores_by_id for candidate_id in global_ids):
@@ -590,13 +701,21 @@ class LLMImageSelectorNode:
         )
         best_index = int(best_record["zero_based_index"])
         best_score = float(best_record["score"])
-        best_image = self._select_original_candidate(candidate_images, best_index)
+        best_image = self._select_original_candidate(
+            candidate_images,
+            candidate_pil_images,
+            candidate_sources,
+            best_index,
+        )
 
         scores_payload = {
             "best_index": best_index,
             "best_id": best_index + 1,
             "best_score": best_score,
+            "best_source": candidate_sources[best_index],
             "candidate_count": candidate_count,
+            "candidate_directory": str(candidate_directory or "").strip(),
+            "recursive_directory": bool(recursive_directory),
             "scored_count": len(scores_by_id),
             "candidates": [
                 scores_by_id[candidate_id]
