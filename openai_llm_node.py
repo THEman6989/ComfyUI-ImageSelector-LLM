@@ -532,6 +532,22 @@ class LLMImageSelectorNode:
                     "default": "",
                     "placeholder": "Extra instructions for LLM folder selection"
                 }),
+                "reranker_endpoint": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "http://127.0.0.1:8012"
+                }),
+                "reranker_model": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "Optional reranker model name"
+                }),
+                "reranker_subdirectory_count": ("INT", {
+                    "default": 3,
+                    "min": 1,
+                    "max": 100,
+                    "step": 1
+                }),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -643,6 +659,128 @@ class LLMImageSelectorNode:
         response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
         response.raise_for_status()
         return _extract_choice_content(response.json())
+
+    def _reranker_urls(self, reranker_endpoint):
+        endpoint = str(reranker_endpoint or "").strip()
+        if not endpoint:
+            return []
+        if "://" not in endpoint:
+            endpoint = "http://" + endpoint
+
+        endpoint = endpoint.rstrip("/")
+        last_segment = endpoint.rsplit("/", 1)[-1]
+        if last_segment in {"rerank", "reranking"}:
+            return [endpoint]
+
+        return [
+            endpoint + "/v1/rerank",
+            endpoint + "/rerank",
+            endpoint + "/reranking",
+            endpoint + "/v1/reranking",
+        ]
+
+    def _reranker_payload(self, query, documents, reranker_model="", top_n=0):
+        payload = {
+            "query": query,
+            "documents": documents,
+        }
+        if reranker_model:
+            payload["model"] = reranker_model
+        if int(top_n) > 0:
+            payload["top_n"] = int(top_n)
+        return payload
+
+    def _reranker_query(self, prompt, subdirectory_selection_prompt):
+        query = "\n".join(
+            part
+            for part in [
+                str(prompt or "").strip(),
+                str(subdirectory_selection_prompt or "").strip(),
+            ]
+            if part
+        )
+        return query or "Select the most relevant image candidates for the requested scene."
+
+    def _parse_reranker_response(self, result, document_count):
+        raw_results = result.get("results")
+        if raw_results is None:
+            raw_results = result.get("data")
+        if raw_results is None:
+            raw_results = result.get("scores")
+
+        scores = []
+        if isinstance(raw_results, list):
+            for index, item in enumerate(raw_results):
+                if isinstance(item, dict):
+                    item_index_value = item.get("index", index)
+                    score_value = item.get("relevance_score", item.get("score"))
+                else:
+                    item_index_value = index
+                    score_value = item
+
+                try:
+                    item_index = int(item_index_value)
+                    if 0 <= item_index < document_count:
+                        scores.append((item_index, float(score_value)))
+                except (TypeError, ValueError):
+                    continue
+
+        return sorted(scores, key=lambda item: item[1], reverse=True)
+
+    def _probe_reranker(self, reranker_endpoint, headers, reranker_model, timeout):
+        urls = self._reranker_urls(reranker_endpoint)
+        info = {
+            "enabled": bool(urls),
+            "available": False,
+            "url": "",
+            "error": "",
+        }
+        if not urls:
+            return None, info
+
+        payload = self._reranker_payload(
+            query="test",
+            documents=["test"],
+            reranker_model=reranker_model,
+            top_n=1,
+        )
+        for url in urls:
+            try:
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=min(max(int(timeout), 1), 10),
+                )
+                response.raise_for_status()
+                scores = self._parse_reranker_response(response.json(), 1)
+                if scores:
+                    info["available"] = True
+                    info["url"] = url
+                    return url, info
+                info["error"] = f"{url}: response did not contain rerank scores"
+            except Exception as exc:
+                info["error"] = f"{url}: {exc}"
+
+        return None, info
+
+    def _rerank_documents(self, reranker_url, headers, reranker_model, query, documents, top_n, timeout):
+        response = requests.post(
+            reranker_url,
+            headers=headers,
+            json=self._reranker_payload(
+                query=query,
+                documents=documents,
+                reranker_model=reranker_model,
+                top_n=top_n,
+            ),
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        scores = self._parse_reranker_response(response.json(), len(documents))
+        if not scores:
+            raise ValueError("Reranker response did not contain usable scores")
+        return scores
 
     def _list_candidate_subdirectories(self, candidate_directory):
         directory = str(candidate_directory or "").strip()
@@ -759,6 +897,68 @@ class LLMImageSelectorNode:
             selection_info["error"] = str(exc)
             return "", selection_info
 
+    def _select_candidate_subdirectories_with_reranker(
+        self,
+        prompt,
+        candidate_directory,
+        reranker_url,
+        headers,
+        reranker_model,
+        subdirectory_selection_prompt,
+        reranker_subdirectory_count,
+        timeout,
+    ):
+        available_subdirectories = self._list_candidate_subdirectories(candidate_directory)
+        selection_info = {
+            "mode": "reranker",
+            "available_subdirectories": available_subdirectories,
+            "selected_subdirectories": [],
+            "scores": [],
+            "fallback_to_all": False,
+        }
+        if not available_subdirectories:
+            selection_info["fallback_to_all"] = True
+            selection_info["error"] = "No subdirectories found"
+            return "", selection_info
+
+        query = self._reranker_query(prompt, subdirectory_selection_prompt)
+        documents = [
+            f"Candidate image folder: {name}"
+            for name in available_subdirectories
+        ]
+
+        try:
+            scores = self._rerank_documents(
+                reranker_url=reranker_url,
+                headers=headers,
+                reranker_model=reranker_model,
+                query=query,
+                documents=documents,
+                top_n=reranker_subdirectory_count,
+                timeout=timeout,
+            )
+            selected = [
+                available_subdirectories[index]
+                for index, _score in scores[:int(reranker_subdirectory_count)]
+            ]
+            selection_info["selected_subdirectories"] = selected
+            selection_info["scores"] = [
+                {
+                    "subdirectory": available_subdirectories[index],
+                    "score": score,
+                }
+                for index, score in scores
+            ]
+            if not selected:
+                selection_info["fallback_to_all"] = True
+                return "", selection_info
+
+            return ",".join(selected), selection_info
+        except Exception as exc:
+            selection_info["fallback_to_all"] = True
+            selection_info["error"] = str(exc)
+            return "", selection_info
+
     def _collect_candidate_images(
         self,
         prompt,
@@ -816,6 +1016,81 @@ class LLMImageSelectorNode:
             [candidate_sources[index] for index in sampled_indexes],
         )
 
+    def _candidate_source_document(self, source):
+        if source.get("type") == "directory":
+            path = Path(source.get("path", ""))
+            return (
+                f"Candidate image file: {path.name}\n"
+                f"Folder: {path.parent.as_posix()}\n"
+                f"Name without extension: {path.stem}"
+            )
+
+        if source.get("type") == "input_batch":
+            return f"Candidate image from input batch index {source.get('batch_index', 0)}"
+
+        if source.get("type") == "image_input":
+            return f"Direct candidate image input index {source.get('batch_index', 0)}"
+
+        return json.dumps(source, ensure_ascii=False)
+
+    def _rerank_candidate_images(
+        self,
+        candidate_pil_images,
+        candidate_sources,
+        reranker_url,
+        headers,
+        reranker_model,
+        prompt,
+        subdirectory_selection_prompt,
+        max_candidate_images,
+        timeout,
+    ):
+        info = {
+            "used": False,
+            "top_n": int(max_candidate_images),
+            "scores": [],
+            "error": "",
+        }
+        if not reranker_url or not candidate_pil_images:
+            return candidate_pil_images, candidate_sources, info
+
+        query = self._reranker_query(prompt, subdirectory_selection_prompt)
+        documents = [
+            self._candidate_source_document(source)
+            for source in candidate_sources
+        ]
+        top_n = int(max_candidate_images) if int(max_candidate_images) > 0 else 0
+
+        try:
+            scores = self._rerank_documents(
+                reranker_url=reranker_url,
+                headers=headers,
+                reranker_model=reranker_model,
+                query=query,
+                documents=documents,
+                top_n=top_n,
+                timeout=timeout,
+            )
+            selected_scores = scores[:top_n] if top_n > 0 else scores
+            selected_indexes = [index for index, _score in selected_scores]
+            info["used"] = True
+            info["scores"] = [
+                {
+                    "index": index,
+                    "score": score,
+                    "source": candidate_sources[index],
+                }
+                for index, score in scores
+            ]
+            return (
+                [candidate_pil_images[index] for index in selected_indexes],
+                [candidate_sources[index] for index in selected_indexes],
+                info,
+            )
+        except Exception as exc:
+            info["error"] = str(exc)
+            return candidate_pil_images, candidate_sources, info
+
     def _select_original_candidate(self, image, candidate_images, candidate_pil_images, candidate_sources, zero_index):
         source = candidate_sources[zero_index]
         if source["type"] == "image_input" and image is not None:
@@ -854,6 +1129,9 @@ class LLMImageSelectorNode:
         max_candidate_images,
         candidate_subdirectories,
         subdirectory_selection_prompt,
+        reranker_endpoint,
+        reranker_model,
+        reranker_subdirectory_count,
         image=None,
         candidate_images=None,
         reference_image=None,
@@ -861,6 +1139,12 @@ class LLMImageSelectorNode:
         system_prompt=DEFAULT_SELECTOR_SYSTEM_PROMPT,
     ):
         headers = self._headers(api_token)
+        reranker_url, reranker_info = self._probe_reranker(
+            reranker_endpoint=reranker_endpoint,
+            headers=headers,
+            reranker_model=reranker_model,
+            timeout=timeout,
+        )
         max_images_per_call = max(1, min(int(max_images_per_call), 32))
         grid_columns = max(1, min(int(grid_columns), 8))
 
@@ -877,7 +1161,29 @@ class LLMImageSelectorNode:
 
         candidate_subdirectory_selection = None
         resolved_candidate_subdirectories = candidate_subdirectories
-        if image is None and str(candidate_subdirectories or "").strip().casefold() == "llm":
+        candidate_subdirectories_mode = str(candidate_subdirectories or "").strip().casefold()
+        if image is None and candidate_subdirectories_mode == "reranker":
+            if reranker_url:
+                resolved_candidate_subdirectories, candidate_subdirectory_selection = (
+                    self._select_candidate_subdirectories_with_reranker(
+                        prompt=prompt,
+                        candidate_directory=candidate_directory,
+                        reranker_url=reranker_url,
+                        headers=headers,
+                        reranker_model=reranker_model,
+                        subdirectory_selection_prompt=subdirectory_selection_prompt,
+                        reranker_subdirectory_count=reranker_subdirectory_count,
+                        timeout=timeout,
+                    )
+                )
+            else:
+                candidate_subdirectory_selection = {
+                    "mode": "reranker",
+                    "fallback_to_all": True,
+                    "error": reranker_info.get("error", "Reranker endpoint is not available"),
+                }
+                resolved_candidate_subdirectories = ""
+        elif image is None and candidate_subdirectories_mode == "llm":
             resolved_candidate_subdirectories, candidate_subdirectory_selection = (
                 self._select_candidate_subdirectories_with_llm(
                     prompt=prompt,
@@ -922,12 +1228,31 @@ class LLMImageSelectorNode:
             )
 
         original_candidate_count = len(candidate_pil_images)
+        reranker_candidate_selection = None
         if image is None:
-            candidate_pil_images, candidate_sources = self._limit_candidate_images(
-                candidate_pil_images,
-                candidate_sources,
-                max_candidate_images,
-            )
+            if reranker_url:
+                (
+                    candidate_pil_images,
+                    candidate_sources,
+                    reranker_candidate_selection,
+                ) = self._rerank_candidate_images(
+                    candidate_pil_images=candidate_pil_images,
+                    candidate_sources=candidate_sources,
+                    reranker_url=reranker_url,
+                    headers=headers,
+                    reranker_model=reranker_model,
+                    prompt=prompt,
+                    subdirectory_selection_prompt=subdirectory_selection_prompt,
+                    max_candidate_images=max_candidate_images,
+                    timeout=timeout,
+                )
+
+            if not reranker_candidate_selection or not reranker_candidate_selection.get("used"):
+                candidate_pil_images, candidate_sources = self._limit_candidate_images(
+                    candidate_pil_images,
+                    candidate_sources,
+                    max_candidate_images,
+                )
 
         scores_by_id = {}
         raw_responses = []
@@ -1047,6 +1372,8 @@ class LLMImageSelectorNode:
             "subdirectory_selection_prompt": str(subdirectory_selection_prompt or "").strip(),
             "resolved_candidate_subdirectories": str(resolved_candidate_subdirectories or "").strip(),
             "candidate_subdirectory_selection": candidate_subdirectory_selection,
+            "reranker": reranker_info,
+            "reranker_candidate_selection": reranker_candidate_selection,
             "recursive_directory": bool(recursive_directory),
             "scored_count": len(scores_by_id),
             "candidates": [
