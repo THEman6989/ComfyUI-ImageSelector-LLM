@@ -3,6 +3,7 @@ import io
 import json
 import math
 import random
+import re
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +16,10 @@ DEFAULT_SELECTOR_SYSTEM_PROMPT = (
     "numbered candidate images. Focus on clothing, colors, patterns, silhouette, "
     "visible accessories, and overall outfit. Ignore background, lighting, pose, "
     "camera angle, and image quality. Return only valid JSON."
+)
+SUBDIRECTORY_SELECTOR_SYSTEM_PROMPT = (
+    "You choose which candidate image folders should be searched before visual "
+    "matching. Return only valid JSON."
 )
 SUPPORTED_IMAGE_EXTENSIONS = {
     ".bmp",
@@ -100,7 +105,80 @@ def _pil_image_to_comfy_image(image):
         return image_array
 
 
-def _load_images_from_directory(directory, recursive=False):
+def _normalize_filter_text(value):
+    return re.sub(r"[_\W]+", " ", str(value or "").casefold()).strip()
+
+
+def _filter_tokens(value):
+    return [
+        token
+        for token in _normalize_filter_text(value).split()
+        if len(token) >= 3
+    ]
+
+
+def _split_subdirectory_filter(value):
+    return [
+        _normalize_filter_text(part)
+        for part in str(value or "").split(",")
+        if _normalize_filter_text(part)
+    ]
+
+
+def _subdirectory_matches_filter(path, root, filters):
+    relative_text = _normalize_filter_text(path.relative_to(root).as_posix())
+    name_text = _normalize_filter_text(path.name)
+
+    return any(
+        filter_text in relative_text
+        or filter_text in name_text
+        or relative_text in filter_text
+        or name_text in filter_text
+        for filter_text in filters
+    )
+
+
+def _subdirectory_matches_prompt(path, prompt):
+    folder_tokens = _filter_tokens(path.name)
+    if not folder_tokens:
+        return False
+
+    prompt_text = _normalize_filter_text(prompt)
+    prompt_tokens = _filter_tokens(prompt)
+    folder_text = _normalize_filter_text(path.name)
+
+    return any(token in prompt_text for token in folder_tokens) or any(
+        token in folder_text for token in prompt_tokens
+    )
+
+
+def _select_subdirectories(root, subdirectory_filter, prompt):
+    subdirectory_filter = str(subdirectory_filter or "").strip()
+    if not subdirectory_filter:
+        return [], "none"
+
+    subdirectories = sorted(path for path in root.rglob("*") if path.is_dir())
+    if not subdirectories:
+        return [], "none"
+
+    if subdirectory_filter.casefold() == "auto":
+        selected = [
+            path
+            for path in subdirectories
+            if _subdirectory_matches_prompt(path, prompt)
+        ]
+        return selected, "auto" if selected else "auto_no_match"
+
+    filters = _split_subdirectory_filter(subdirectory_filter)
+    selected = [
+        path
+        for path in subdirectories
+        if _subdirectory_matches_filter(path, root, filters)
+    ]
+    return selected, "manual"
+
+
+def _load_images_from_directory(directory, recursive=False, subdirectory_filter="", prompt=""):
     """Load every supported image file from a directory as RGB PIL images."""
     directory = str(directory or "").strip()
     if not directory:
@@ -112,12 +190,39 @@ def _load_images_from_directory(directory, recursive=False):
     if not root.is_dir():
         raise ValueError(f"candidate_directory is not a directory: {root}")
 
-    iterator = root.rglob("*") if recursive else root.iterdir()
-    image_paths = sorted(
-        path
-        for path in iterator
-        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+    selected_subdirectories, filter_mode = _select_subdirectories(
+        root,
+        subdirectory_filter,
+        prompt,
     )
+    if selected_subdirectories:
+        iterators = [
+            subdirectory.rglob("*") if recursive else subdirectory.iterdir()
+            for subdirectory in selected_subdirectories
+        ]
+        image_paths = sorted({
+            path
+            for iterator in iterators
+            for path in iterator
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        })
+    else:
+        iterator = root.rglob("*") if recursive else root.iterdir()
+        image_paths = sorted(
+            path
+            for path in iterator
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+        )
+
+    if filter_mode == "manual" and not selected_subdirectories:
+        raise ValueError(
+            "candidate_subdirectories did not match any subfolders in candidate_directory"
+        )
+
+    if selected_subdirectories and not image_paths:
+        raise ValueError(
+            "candidate_subdirectories matched subfolders, but no supported image files were found"
+        )
 
     images = []
     loaded_paths = []
@@ -417,6 +522,16 @@ class LLMImageSelectorNode:
                     "max": 10000,
                     "step": 1
                 }),
+                "candidate_subdirectories": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "llm, auto, or comma-separated folder names"
+                }),
+                "subdirectory_selection_prompt": ("STRING", {
+                    "multiline": True,
+                    "default": "",
+                    "placeholder": "Extra instructions for LLM folder selection"
+                }),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -529,7 +644,130 @@ class LLMImageSelectorNode:
         response.raise_for_status()
         return _extract_choice_content(response.json())
 
-    def _collect_candidate_images(self, candidate_directory, recursive_directory, candidate_images, image=None):
+    def _list_candidate_subdirectories(self, candidate_directory):
+        directory = str(candidate_directory or "").strip()
+        if not directory:
+            return []
+
+        root = Path(directory).expanduser()
+        if not root.exists():
+            raise ValueError(f"candidate_directory does not exist: {root}")
+        if not root.is_dir():
+            raise ValueError(f"candidate_directory is not a directory: {root}")
+
+        return [
+            path.relative_to(root).as_posix()
+            for path in sorted(root.rglob("*"))
+            if path.is_dir()
+        ]
+
+    def _match_llm_selected_subdirectories(self, selected_names, available_subdirectories):
+        matched = []
+        for selected_name in selected_names:
+            selected_text = _normalize_filter_text(selected_name)
+            if not selected_text:
+                continue
+
+            for available in available_subdirectories:
+                available_text = _normalize_filter_text(available)
+                available_name_text = _normalize_filter_text(Path(available).name)
+                if (
+                    selected_text == available_text
+                    or selected_text == available_name_text
+                    or selected_text in available_text
+                    or selected_text in available_name_text
+                    or available_name_text in selected_text
+                ):
+                    if available not in matched:
+                        matched.append(available)
+
+        return matched
+
+    def _select_candidate_subdirectories_with_llm(
+        self,
+        prompt,
+        candidate_directory,
+        endpoint,
+        headers,
+        model,
+        reference_parts,
+        subdirectory_selection_prompt,
+        max_tokens,
+        timeout,
+    ):
+        available_subdirectories = self._list_candidate_subdirectories(candidate_directory)
+        selection_info = {
+            "mode": "llm",
+            "available_subdirectories": available_subdirectories,
+            "selected_subdirectories": [],
+            "raw_response": "",
+            "fallback_to_all": False,
+        }
+        if not available_subdirectories:
+            selection_info["fallback_to_all"] = True
+            selection_info["error"] = "No subdirectories found"
+            return "", selection_info
+
+        folder_list = "\n".join(f"- {name}" for name in available_subdirectories)
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    "Choose the candidate subfolders that are relevant for this image "
+                    "selection request. You may choose one or multiple folders. If no "
+                    "specific folder is clearly relevant, return an empty list so all "
+                    "folders can be searched.\n\n"
+                    f"User prompt:\n{prompt.strip()}\n\n"
+                    f"Extra folder/style instructions:\n{subdirectory_selection_prompt.strip()}\n\n"
+                    f"Available subfolders:\n{folder_list}\n\n"
+                    "Return only valid JSON with this exact schema:\n"
+                    '{ "subdirectories": ["relative/folder/name"] }'
+                ),
+            },
+        ]
+        content.extend(reference_parts)
+
+        try:
+            raw_text = self._post_chunk(
+                endpoint=endpoint,
+                headers=headers,
+                model=model,
+                system_prompt=SUBDIRECTORY_SELECTOR_SYSTEM_PROMPT,
+                content=content,
+                max_tokens=max(64, min(int(max_tokens), 1024)),
+                temperature=0.0,
+                timeout=timeout,
+            )
+            selection_info["raw_response"] = raw_text
+            parsed = self._extract_first_json_object(raw_text)
+            selected_names = parsed.get("subdirectories", [])
+            if not isinstance(selected_names, list):
+                raise ValueError('JSON response must contain a "subdirectories" list')
+
+            matched = self._match_llm_selected_subdirectories(
+                selected_names,
+                available_subdirectories,
+            )
+            selection_info["selected_subdirectories"] = matched
+            if not matched:
+                selection_info["fallback_to_all"] = True
+                return "", selection_info
+
+            return ",".join(matched), selection_info
+        except Exception as exc:
+            selection_info["fallback_to_all"] = True
+            selection_info["error"] = str(exc)
+            return "", selection_info
+
+    def _collect_candidate_images(
+        self,
+        prompt,
+        candidate_directory,
+        recursive_directory,
+        candidate_subdirectories,
+        candidate_images,
+        image=None,
+    ):
         candidate_pil_images = []
         candidate_sources = []
 
@@ -546,6 +784,8 @@ class LLMImageSelectorNode:
         directory_images, directory_paths = _load_images_from_directory(
             candidate_directory,
             recursive=recursive_directory,
+            subdirectory_filter=candidate_subdirectories,
+            prompt=prompt,
         )
         for image, path in zip(directory_images, directory_paths):
             candidate_sources.append({
@@ -612,31 +852,14 @@ class LLMImageSelectorNode:
         add_id_labels,
         return_descriptions,
         max_candidate_images,
+        candidate_subdirectories,
+        subdirectory_selection_prompt,
         image=None,
         candidate_images=None,
         reference_image=None,
         reference_video=None,
         system_prompt=DEFAULT_SELECTOR_SYSTEM_PROMPT,
     ):
-        candidate_pil_images, candidate_sources = self._collect_candidate_images(
-            candidate_directory=candidate_directory,
-            recursive_directory=recursive_directory,
-            candidate_images=candidate_images,
-            image=image,
-        )
-        if not candidate_pil_images:
-            raise ValueError(
-                "No candidate images found. Connect image, candidate_images, set candidate_directory, or use both."
-            )
-
-        original_candidate_count = len(candidate_pil_images)
-        if image is None:
-            candidate_pil_images, candidate_sources = self._limit_candidate_images(
-                candidate_pil_images,
-                candidate_sources,
-                max_candidate_images,
-            )
-
         headers = self._headers(api_token)
         max_images_per_call = max(1, min(int(max_images_per_call), 32))
         grid_columns = max(1, min(int(grid_columns), 8))
@@ -651,6 +874,60 @@ class LLMImageSelectorNode:
             reference_labels = [f"REF-{index + 1}" for index in range(len(reference_frames))]
             reference_sheet = _build_contact_sheet(reference_frames, grid_columns, reference_labels)
             reference_parts.append(_image_url_part(_encode_pil_to_data_url(reference_sheet)))
+
+        candidate_subdirectory_selection = None
+        resolved_candidate_subdirectories = candidate_subdirectories
+        if image is None and str(candidate_subdirectories or "").strip().casefold() == "llm":
+            resolved_candidate_subdirectories, candidate_subdirectory_selection = (
+                self._select_candidate_subdirectories_with_llm(
+                    prompt=prompt,
+                    candidate_directory=candidate_directory,
+                    endpoint=endpoint,
+                    headers=headers,
+                    model=model,
+                    reference_parts=reference_parts,
+                    subdirectory_selection_prompt=subdirectory_selection_prompt,
+                    max_tokens=max_tokens,
+                    timeout=timeout,
+                )
+            )
+
+        try:
+            candidate_pil_images, candidate_sources = self._collect_candidate_images(
+                prompt=prompt,
+                candidate_directory=candidate_directory,
+                recursive_directory=recursive_directory,
+                candidate_subdirectories=resolved_candidate_subdirectories,
+                candidate_images=candidate_images,
+                image=image,
+            )
+        except ValueError as exc:
+            if candidate_subdirectory_selection is None:
+                raise
+
+            candidate_subdirectory_selection["fallback_to_all"] = True
+            candidate_subdirectory_selection["fallback_error"] = str(exc)
+            resolved_candidate_subdirectories = ""
+            candidate_pil_images, candidate_sources = self._collect_candidate_images(
+                prompt=prompt,
+                candidate_directory=candidate_directory,
+                recursive_directory=recursive_directory,
+                candidate_subdirectories=resolved_candidate_subdirectories,
+                candidate_images=candidate_images,
+                image=image,
+            )
+        if not candidate_pil_images:
+            raise ValueError(
+                "No candidate images found. Connect image, candidate_images, set candidate_directory, or use both."
+            )
+
+        original_candidate_count = len(candidate_pil_images)
+        if image is None:
+            candidate_pil_images, candidate_sources = self._limit_candidate_images(
+                candidate_pil_images,
+                candidate_sources,
+                max_candidate_images,
+            )
 
         scores_by_id = {}
         raw_responses = []
@@ -766,6 +1043,10 @@ class LLMImageSelectorNode:
             "original_candidate_count": original_candidate_count,
             "max_candidate_images": int(max_candidate_images),
             "candidate_directory": str(candidate_directory or "").strip(),
+            "candidate_subdirectories": str(candidate_subdirectories or "").strip(),
+            "subdirectory_selection_prompt": str(subdirectory_selection_prompt or "").strip(),
+            "resolved_candidate_subdirectories": str(resolved_candidate_subdirectories or "").strip(),
+            "candidate_subdirectory_selection": candidate_subdirectory_selection,
             "recursive_directory": bool(recursive_directory),
             "scored_count": len(scores_by_id),
             "candidates": [

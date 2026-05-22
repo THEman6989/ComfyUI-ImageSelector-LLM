@@ -45,6 +45,8 @@ Inputs:
 | `add_id_labels` | BOOLEAN | Draw visible 1-based candidate IDs on the contact sheet. |
 | `return_descriptions` | BOOLEAN | Include model reasons in `scores_json`. |
 | `max_candidate_images` | INT | Randomly limit the candidate pool before scoring. `0` means no limit. |
+| `candidate_subdirectories` | STRING | Optional subfolder prefilter. Use `llm` to let the model choose folders, `auto` to match folder names from the prompt, or comma-separated names like `dresses,jackets`. |
+| `subdirectory_selection_prompt` | STRING | Extra instructions for the `llm` folder-selection step, such as clothing style or category preferences. |
 | `reference_image` | IMAGE | Optional reference image attached to every request. |
 | `reference_video` | IMAGE | Optional IMAGE batch treated as video frames; up to 6 frames are sampled. |
 | `system_prompt` | STRING | Optional judge/system instructions. |
@@ -108,6 +110,12 @@ lighting, facial expression, and image quality.
 Candidates can come from `image`, `candidate_directory`, `candidate_images`, or a combination of directory and batch candidates. When the direct `image` input is connected, it takes priority and is used as the candidate source instead of directory or `candidate_images` inputs. Without `image`, directory files are loaded first, sorted by path, then any connected ComfyUI IMAGE batch is appended. Supported file extensions are `bmp`, `gif`, `jpg`, `jpeg`, `png`, `tif`, `tiff`, and `webp`.
 
 `candidate_images` is a ComfyUI IMAGE batch shaped `[B,H,W,C]`. The selector preserves every candidate in the batch, adds optional visible labels `1`, `2`, `3`, and builds contact sheet grids.
+
+Set `candidate_subdirectories` to prefilter folder-based candidates before random sampling and LLM scoring. The recommended value is `llm`: the node first sends the available subfolder list, prompt, and optional reference image/video to the same model and asks it to choose one or more relevant folders. If the model cannot choose a folder or the folder selection call fails, the node falls back to the normal full directory scan.
+
+Use `subdirectory_selection_prompt` with `candidate_subdirectories=llm` to tell the model which clothing style or categories it should prefer before loading images, for example `prefer elegant dresses, use jackets only if they match the scene`.
+
+A comma-separated value such as `dresses,jackets` only loads matching subfolders below `candidate_directory`. The special value `auto` uses cheap text matching instead of an extra LLM call: it selects subfolders whose folder names appear in the prompt, for example a prompt mentioning `dress` can match a `dresses` or `kleider` folder if the wording overlaps. If `auto` finds no matching folder, the node falls back to the normal full directory scan.
 
 Set `max_candidate_images` to randomly sample a smaller pool before any LLM calls are made. For example, if a folder contains 1000 images and `max_candidate_images` is `30`, the node scores only 30 randomly selected candidates. If the pool has fewer images than the limit, all candidates are used. `0` disables the limit.
 
