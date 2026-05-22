@@ -412,6 +412,7 @@ class LLMImageSelectorNode:
                 }),
             },
             "optional": {
+                "image": ("IMAGE",),
                 "candidate_images": ("IMAGE",),
                 "reference_image": ("IMAGE",),
                 "reference_video": ("IMAGE",),
@@ -521,9 +522,19 @@ class LLMImageSelectorNode:
         response.raise_for_status()
         return _extract_choice_content(response.json())
 
-    def _collect_candidate_images(self, candidate_directory, recursive_directory, candidate_images):
+    def _collect_candidate_images(self, candidate_directory, recursive_directory, candidate_images, image=None):
         candidate_pil_images = []
         candidate_sources = []
+
+        if image is not None:
+            input_images = _image_batch_to_pil_images(image)
+            for batch_index, input_image in enumerate(input_images):
+                candidate_sources.append({
+                    "type": "image_input",
+                    "batch_index": batch_index,
+                })
+                candidate_pil_images.append(input_image)
+            return candidate_pil_images, candidate_sources
 
         directory_images, directory_paths = _load_images_from_directory(
             candidate_directory,
@@ -547,8 +558,16 @@ class LLMImageSelectorNode:
 
         return candidate_pil_images, candidate_sources
 
-    def _select_original_candidate(self, candidate_images, candidate_pil_images, candidate_sources, zero_index):
+    def _select_original_candidate(self, image, candidate_images, candidate_pil_images, candidate_sources, zero_index):
         source = candidate_sources[zero_index]
+        if source["type"] == "image_input" and image is not None:
+            batch_index = source["batch_index"]
+            if len(image.shape) == 4:
+                return image[batch_index:batch_index + 1]
+            if hasattr(image, "unsqueeze"):
+                return image.unsqueeze(0)
+            return np.expand_dims(image, axis=0)
+
         if source["type"] == "input_batch" and candidate_images is not None:
             batch_index = source["batch_index"]
             if len(candidate_images.shape) == 4:
@@ -574,6 +593,7 @@ class LLMImageSelectorNode:
         grid_columns,
         add_id_labels,
         return_descriptions,
+        image=None,
         candidate_images=None,
         reference_image=None,
         reference_video=None,
@@ -583,10 +603,11 @@ class LLMImageSelectorNode:
             candidate_directory=candidate_directory,
             recursive_directory=recursive_directory,
             candidate_images=candidate_images,
+            image=image,
         )
         if not candidate_pil_images:
             raise ValueError(
-                "No candidate images found. Connect candidate_images, set candidate_directory, or use both."
+                "No candidate images found. Connect image, candidate_images, set candidate_directory, or use both."
             )
 
         headers = self._headers(api_token)
@@ -702,6 +723,7 @@ class LLMImageSelectorNode:
         best_index = int(best_record["zero_based_index"])
         best_score = float(best_record["score"])
         best_image = self._select_original_candidate(
+            image,
             candidate_images,
             candidate_pil_images,
             candidate_sources,

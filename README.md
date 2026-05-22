@@ -35,6 +35,7 @@ Inputs:
 | `model` | STRING | Model name sent in the request body. |
 | `candidate_directory` | STRING | Optional folder path. Every supported image file in the folder becomes a candidate. |
 | `recursive_directory` | BOOLEAN | Also load images from subfolders when `candidate_directory` is set. |
+| `image` | IMAGE | Optional direct image input. When connected, this image is sent to the API instead of random/directory/batch candidates. |
 | `candidate_images` | IMAGE | Optional ComfyUI image batch `[B,H,W,C]`; each batch item is one candidate. |
 | `max_images_per_call` | INT | Number of candidates per LLM request. Default `8`. |
 | `max_tokens` | INT | Maximum response tokens. Default `1024`. |
@@ -103,7 +104,7 @@ lighting, facial expression, and image quality.
 
 ## Chunking With max_images_per_call
 
-Candidates can come from `candidate_directory`, `candidate_images`, or both. Directory files are loaded first, sorted by path, then any connected ComfyUI IMAGE batch is appended. Supported file extensions are `bmp`, `gif`, `jpg`, `jpeg`, `png`, `tif`, `tiff`, and `webp`.
+Candidates can come from `image`, `candidate_directory`, `candidate_images`, or a combination of directory and batch candidates. When the direct `image` input is connected, it takes priority and is used as the candidate source instead of directory or `candidate_images` inputs. Without `image`, directory files are loaded first, sorted by path, then any connected ComfyUI IMAGE batch is appended. Supported file extensions are `bmp`, `gif`, `jpg`, `jpeg`, `png`, `tif`, `tiff`, and `webp`.
 
 `candidate_images` is a ComfyUI IMAGE batch shaped `[B,H,W,C]`. The selector preserves every candidate in the batch, adds optional visible labels `1`, `2`, `3`, and builds contact sheet grids.
 
