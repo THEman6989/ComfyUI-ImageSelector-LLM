@@ -94,15 +94,32 @@ def _image_batch_to_pil_images(image_tensor):
 
 def _pil_image_to_comfy_image(image):
     """Convert a PIL image to a ComfyUI IMAGE batch shaped [1,H,W,C]."""
-    image_array = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    image_array = np.expand_dims(image_array, axis=0)
+    return _pil_list_to_comfy_batch([image])
+
+
+def _pil_list_to_comfy_batch(images):
+    """Convert a list of PIL images into a ComfyUI IMAGE batch [B,H,W,C]."""
+    if not images:
+        return None
+
+    # Use the first image's size as the reference to ensure a valid batch
+    width, height = images[0].size
+
+    processed_images = []
+    for img in images:
+        if img.size != (width, height):
+            img = img.resize((width, height), Image.Resampling.LANCZOS)
+        img_array = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+        processed_images.append(img_array)
+
+    batch_array = np.stack(processed_images, axis=0)
 
     try:
         import torch
 
-        return torch.from_numpy(image_array)
+        return torch.from_numpy(batch_array)
     except Exception:
-        return image_array
+        return batch_array
 
 
 def _normalize_filter_text(value):
@@ -522,6 +539,11 @@ class LLMImageSelectorNode:
                     "max": 10000,
                     "step": 1
                 }),
+                "seed": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 0xffffffffffffffff
+                }),
                 "candidate_subdirectories": ("STRING", {
                     "multiline": False,
                     "default": "",
@@ -561,8 +583,8 @@ class LLMImageSelectorNode:
             }
         }
 
-    RETURN_TYPES = ("IMAGE", "INT", "FLOAT", "STRING", "STRING")
-    RETURN_NAMES = ("best_image", "best_index", "best_score", "scores_json", "raw_response")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "INT", "FLOAT", "STRING", "STRING")
+    RETURN_NAMES = ("best_image", "candidate_images", "best_index", "best_score", "scores_json", "raw_response")
     FUNCTION = "select_image"
     CATEGORY = "LLM/Image Selection"
 
@@ -1107,12 +1129,13 @@ class LLMImageSelectorNode:
 
         return candidate_pil_images, candidate_sources
 
-    def _limit_candidate_images(self, candidate_pil_images, candidate_sources, max_candidate_images):
+    def _limit_candidate_images(self, candidate_pil_images, candidate_sources, max_candidate_images, seed=None):
         max_candidate_images = int(max_candidate_images)
         if max_candidate_images <= 0 or len(candidate_pil_images) <= max_candidate_images:
             return candidate_pil_images, candidate_sources
 
-        sampled_indexes = random.sample(range(len(candidate_pil_images)), max_candidate_images)
+        r = random.Random(seed) if seed is not None else random
+        sampled_indexes = r.sample(range(len(candidate_pil_images)), max_candidate_images)
         return (
             [candidate_pil_images[index] for index in sampled_indexes],
             [candidate_sources[index] for index in sampled_indexes],
@@ -1229,6 +1252,7 @@ class LLMImageSelectorNode:
         add_id_labels,
         return_descriptions,
         max_candidate_images,
+        seed,
         candidate_subdirectories,
         subdirectory_selection_prompt,
         reranker_endpoint,
@@ -1354,7 +1378,11 @@ class LLMImageSelectorNode:
                     candidate_pil_images,
                     candidate_sources,
                     max_candidate_images,
+                    seed=seed,
                 )
+
+        # Convert the actually used candidate images to a ComfyUI batch
+        candidate_batch = _pil_list_to_comfy_batch(candidate_pil_images)
 
         scores_by_id = {}
         raw_responses = []
@@ -1469,6 +1497,7 @@ class LLMImageSelectorNode:
             "candidate_count": candidate_count,
             "original_candidate_count": original_candidate_count,
             "max_candidate_images": int(max_candidate_images),
+            "seed": int(seed),
             "candidate_directory": str(candidate_directory or "").strip(),
             "candidate_subdirectories": str(candidate_subdirectories or "").strip(),
             "subdirectory_selection_prompt": str(subdirectory_selection_prompt or "").strip(),
@@ -1487,6 +1516,7 @@ class LLMImageSelectorNode:
 
         return (
             best_image,
+            candidate_batch,
             best_index,
             best_score,
             json.dumps(scores_payload, ensure_ascii=False, indent=2),
