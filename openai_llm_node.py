@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import math
+import random
 from pathlib import Path
 
 import numpy as np
@@ -410,6 +411,12 @@ class LLMImageSelectorNode:
                 "return_descriptions": ("BOOLEAN", {
                     "default": False
                 }),
+                "max_candidate_images": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 10000,
+                    "step": 1
+                }),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -558,6 +565,17 @@ class LLMImageSelectorNode:
 
         return candidate_pil_images, candidate_sources
 
+    def _limit_candidate_images(self, candidate_pil_images, candidate_sources, max_candidate_images):
+        max_candidate_images = int(max_candidate_images)
+        if max_candidate_images <= 0 or len(candidate_pil_images) <= max_candidate_images:
+            return candidate_pil_images, candidate_sources
+
+        sampled_indexes = random.sample(range(len(candidate_pil_images)), max_candidate_images)
+        return (
+            [candidate_pil_images[index] for index in sampled_indexes],
+            [candidate_sources[index] for index in sampled_indexes],
+        )
+
     def _select_original_candidate(self, image, candidate_images, candidate_pil_images, candidate_sources, zero_index):
         source = candidate_sources[zero_index]
         if source["type"] == "image_input" and image is not None:
@@ -593,6 +611,7 @@ class LLMImageSelectorNode:
         grid_columns,
         add_id_labels,
         return_descriptions,
+        max_candidate_images,
         image=None,
         candidate_images=None,
         reference_image=None,
@@ -608,6 +627,14 @@ class LLMImageSelectorNode:
         if not candidate_pil_images:
             raise ValueError(
                 "No candidate images found. Connect image, candidate_images, set candidate_directory, or use both."
+            )
+
+        original_candidate_count = len(candidate_pil_images)
+        if image is None:
+            candidate_pil_images, candidate_sources = self._limit_candidate_images(
+                candidate_pil_images,
+                candidate_sources,
+                max_candidate_images,
             )
 
         headers = self._headers(api_token)
@@ -736,6 +763,8 @@ class LLMImageSelectorNode:
             "best_score": best_score,
             "best_source": candidate_sources[best_index],
             "candidate_count": candidate_count,
+            "original_candidate_count": original_candidate_count,
+            "max_candidate_images": int(max_candidate_images),
             "candidate_directory": str(candidate_directory or "").strip(),
             "recursive_directory": bool(recursive_directory),
             "scored_count": len(scores_by_id),
