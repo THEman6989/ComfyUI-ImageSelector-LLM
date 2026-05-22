@@ -679,6 +679,45 @@ class LLMImageSelectorNode:
             endpoint + "/v1/reranking",
         ]
 
+    def _reranker_base_url(self, reranker_endpoint):
+        endpoint = str(reranker_endpoint or "").strip()
+        if not endpoint:
+            return ""
+        if "://" not in endpoint:
+            endpoint = "http://" + endpoint
+
+        endpoint = endpoint.rstrip("/")
+        for suffix in ("/v1/reranking", "/v1/rerank", "/reranking", "/rerank"):
+            if endpoint.endswith(suffix):
+                return endpoint[: -len(suffix)]
+        return endpoint
+
+    def _detect_reranker_model(self, reranker_endpoint, headers, reranker_model, timeout):
+        reranker_model = str(reranker_model or "").strip()
+        if reranker_model:
+            return reranker_model, "configured"
+
+        base_url = self._reranker_base_url(reranker_endpoint)
+        if not base_url:
+            return "", "none"
+
+        try:
+            response = requests.get(
+                base_url + "/v1/models",
+                headers=headers,
+                timeout=min(max(int(timeout), 1), 10),
+            )
+            response.raise_for_status()
+            models = response.json().get("data", [])
+            if models:
+                model_id = str(models[0].get("id", "")).strip()
+                if model_id:
+                    return model_id, "v1/models"
+        except Exception:
+            pass
+
+        return "", "none"
+
     def _reranker_payload(self, query, documents, reranker_model="", top_n=0):
         payload = {
             "query": query,
@@ -688,6 +727,7 @@ class LLMImageSelectorNode:
             payload["model"] = reranker_model
         if int(top_n) > 0:
             payload["top_n"] = int(top_n)
+        payload["return_documents"] = False
         return payload
 
     def _reranker_query(self, prompt, subdirectory_selection_prompt):
@@ -702,11 +742,16 @@ class LLMImageSelectorNode:
         return query or "Select the most relevant image candidates for the requested scene."
 
     def _parse_reranker_response(self, result, document_count):
-        raw_results = result.get("results")
-        if raw_results is None:
-            raw_results = result.get("data")
-        if raw_results is None:
-            raw_results = result.get("scores")
+        if isinstance(result, list):
+            raw_results = result
+        elif isinstance(result, dict):
+            raw_results = result.get("results")
+            if raw_results is None:
+                raw_results = result.get("data")
+            if raw_results is None:
+                raw_results = result.get("scores")
+        else:
+            raw_results = None
 
         scores = []
         if isinstance(raw_results, list):
@@ -729,19 +774,28 @@ class LLMImageSelectorNode:
 
     def _probe_reranker(self, reranker_endpoint, headers, reranker_model, timeout):
         urls = self._reranker_urls(reranker_endpoint)
+        resolved_model, model_source = self._detect_reranker_model(
+            reranker_endpoint,
+            headers,
+            reranker_model,
+            timeout,
+        )
         info = {
             "enabled": bool(urls),
             "available": False,
             "url": "",
+            "model": resolved_model,
+            "model_source": model_source,
+            "provider": "unknown",
             "error": "",
         }
         if not urls:
-            return None, info
+            return None, resolved_model, info
 
         payload = self._reranker_payload(
             query="test",
             documents=["test"],
-            reranker_model=reranker_model,
+            reranker_model=resolved_model,
             top_n=1,
         )
         for url in urls:
@@ -757,12 +811,18 @@ class LLMImageSelectorNode:
                 if scores:
                     info["available"] = True
                     info["url"] = url
-                    return url, info
+                    if url.endswith("/v1/rerank") and isinstance(response.json(), list):
+                        info["provider"] = "sglang_or_vllm_style"
+                    elif url.endswith("/v1/rerank"):
+                        info["provider"] = "llamacpp_or_openai_style"
+                    elif "reranking" in url or url.endswith("/rerank"):
+                        info["provider"] = "llamacpp_style"
+                    return url, resolved_model, info
                 info["error"] = f"{url}: response did not contain rerank scores"
             except Exception as exc:
                 info["error"] = f"{url}: {exc}"
 
-        return None, info
+        return None, resolved_model, info
 
     def _rerank_documents(self, reranker_url, headers, reranker_model, query, documents, top_n, timeout):
         response = requests.post(
@@ -1139,7 +1199,7 @@ class LLMImageSelectorNode:
         system_prompt=DEFAULT_SELECTOR_SYSTEM_PROMPT,
     ):
         headers = self._headers(api_token)
-        reranker_url, reranker_info = self._probe_reranker(
+        reranker_url, resolved_reranker_model, reranker_info = self._probe_reranker(
             reranker_endpoint=reranker_endpoint,
             headers=headers,
             reranker_model=reranker_model,
@@ -1170,7 +1230,7 @@ class LLMImageSelectorNode:
                         candidate_directory=candidate_directory,
                         reranker_url=reranker_url,
                         headers=headers,
-                        reranker_model=reranker_model,
+                        reranker_model=resolved_reranker_model,
                         subdirectory_selection_prompt=subdirectory_selection_prompt,
                         reranker_subdirectory_count=reranker_subdirectory_count,
                         timeout=timeout,
@@ -1240,7 +1300,7 @@ class LLMImageSelectorNode:
                     candidate_sources=candidate_sources,
                     reranker_url=reranker_url,
                     headers=headers,
-                    reranker_model=reranker_model,
+                    reranker_model=resolved_reranker_model,
                     prompt=prompt,
                     subdirectory_selection_prompt=subdirectory_selection_prompt,
                     max_candidate_images=max_candidate_images,

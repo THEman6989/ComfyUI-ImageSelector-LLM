@@ -45,10 +45,10 @@ Inputs:
 | `add_id_labels` | BOOLEAN | Draw visible 1-based candidate IDs on the contact sheet. |
 | `return_descriptions` | BOOLEAN | Include model reasons in `scores_json`. |
 | `max_candidate_images` | INT | Randomly limit the candidate pool before scoring. `0` means no limit. |
-| `candidate_subdirectories` | STRING | Optional subfolder prefilter. Use `llm` to let the model choose folders, `reranker` to use a llama.cpp reranker, `auto` to match folder names from the prompt, or comma-separated names like `dresses,jackets`. |
+| `candidate_subdirectories` | STRING | Optional subfolder prefilter. Use `llm` to let the model choose folders, `reranker` to use a reranker server, `auto` to match folder names from the prompt, or comma-separated names like `dresses,jackets`. |
 | `subdirectory_selection_prompt` | STRING | Extra instructions for the `llm` or `reranker` folder-selection step, such as clothing style or category preferences. |
-| `reranker_endpoint` | STRING | Optional llama.cpp reranker server base URL, for example `http://127.0.0.1:8012`. |
-| `reranker_model` | STRING | Optional model name sent to the reranker request body. Leave empty for local llama.cpp servers that do not require it. |
+| `reranker_endpoint` | STRING | Optional reranker server base URL, for example `http://127.0.0.1:8012`. Supports llama.cpp and SGLang-style `/v1/rerank` responses. |
+| `reranker_model` | STRING | Optional model name sent to the reranker request body. Leave empty to auto-read the first model from `/v1/models` when available. |
 | `reranker_subdirectory_count` | INT | Number of top subfolders to keep when `candidate_subdirectories` is `reranker`. |
 | `reference_image` | IMAGE | Optional reference image attached to every request. |
 | `reference_video` | IMAGE | Optional IMAGE batch treated as video frames; up to 6 frames are sampled. |
@@ -72,6 +72,8 @@ This is the original text/image prompt node. It remains available as **OpenAI Co
 
 ## llama.cpp Endpoint Example
 
+The main `endpoint` uses OpenAI-compatible chat completions. It can point at llama.cpp, SGLang, LMDeploy, or another compatible vision server as long as it accepts image content at `/v1/chat/completions`.
+
 Start a llama.cpp server with a vision-capable model and projector, then point the node at the local OpenAI-compatible endpoint:
 
 ```bash
@@ -92,6 +94,8 @@ temperature: 0.0
 ```
 
 Leave `api_token` empty unless your server requires authentication.
+
+For SGLang or LMDeploy, use their normal OpenAI-compatible chat endpoint, for example `http://127.0.0.1:30000/v1/chat/completions` for SGLang or `http://127.0.0.1:23333/v1/chat/completions` for LMDeploy.
 
 ## Visual Scoring, Not Tool Calling
 
@@ -120,7 +124,9 @@ Use `subdirectory_selection_prompt` with `candidate_subdirectories=llm` or `cand
 
 A comma-separated value such as `dresses,jackets` only loads matching subfolders below `candidate_directory`. The special value `auto` uses cheap text matching instead of an extra LLM call: it selects subfolders whose folder names appear in the prompt, for example a prompt mentioning `dress` can match a `dresses` or `kleider` folder if the wording overlaps. If `auto` finds no matching folder, the node falls back to the normal full directory scan.
 
-Set `reranker_endpoint` to use a llama.cpp reranker before the final vision LLM call. The node probes `/v1/rerank`, `/rerank`, `/reranking`, and `/v1/reranking` with a tiny test request and only uses the reranker when it returns usable scores. llama.cpp reranking is text-based, so it ranks folder names and candidate source paths; it does not inspect image pixels. Start a reranker server with a reranking GGUF model and llama.cpp's reranking options, for example `llama-server -m /path/to/reranker.gguf --embedding --pooling rank --reranking --host 127.0.0.1 --port 8012`.
+Set `reranker_endpoint` to use a reranker before the final vision LLM call. The node probes `/v1/rerank`, `/rerank`, `/reranking`, and `/v1/reranking` with a tiny test request and only uses the reranker when it returns usable scores. It parses both llama.cpp-style JSON objects with `results` and SGLang-style top-level result lists. If `reranker_model` is empty, it tries `/v1/models` first and uses the first returned model id, which is useful for SGLang where `/v1/rerank` requires `model`.
+
+Reranking here is text-based, so it ranks folder names and candidate source paths; it does not inspect image pixels. Start a llama.cpp reranker server with a reranking GGUF model and llama.cpp's reranking options, for example `llama-server -m /path/to/reranker.gguf --embedding --pooling rank --reranking --host 127.0.0.1 --port 8012`. For SGLang cross-encoder rerankers, launch with a rerank model and call the same base URL, for example `python3 -m sglang.launch_server --model-path BAAI/bge-reranker-v2-m3 --is-embedding --host 0.0.0.0 --port 30000`.
 
 Set `max_candidate_images` to limit the pool before final LLM scoring. If a working reranker is configured, the top `max_candidate_images` text-ranked candidates are kept. If no reranker is available, the node randomly samples that many candidates. For example, if a folder contains 1000 images and `max_candidate_images` is `30`, the node scores only 30 selected candidates. If the pool has fewer images than the limit, all candidates are used. `0` disables candidate-count limiting, though an available reranker may still sort candidates by source-text relevance.
 
