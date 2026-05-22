@@ -674,6 +674,7 @@ class LLMImageSelectorNode:
 
         return [
             endpoint + "/v1/rerank",
+            endpoint + "/v2/rerank",
             endpoint + "/rerank",
             endpoint + "/reranking",
             endpoint + "/v1/reranking",
@@ -687,19 +688,55 @@ class LLMImageSelectorNode:
             endpoint = "http://" + endpoint
 
         endpoint = endpoint.rstrip("/")
-        for suffix in ("/v1/reranking", "/v1/rerank", "/reranking", "/rerank"):
+        for suffix in ("/v1/reranking", "/v2/rerank", "/v1/rerank", "/reranking", "/rerank"):
             if endpoint.endswith(suffix):
                 return endpoint[: -len(suffix)]
         return endpoint
 
+    def _detect_reranker_server(self, reranker_endpoint, headers, timeout):
+        base_url = self._reranker_base_url(reranker_endpoint)
+        info = {
+            "base_url": base_url,
+            "version": "",
+            "health": "",
+            "models": [],
+        }
+        if not base_url:
+            return info
+
+        try:
+            response = requests.get(
+                base_url + "/version",
+                headers=headers,
+                timeout=min(max(int(timeout), 1), 10),
+            )
+            response.raise_for_status()
+            data = response.json()
+            info["version"] = data.get("version", str(data))
+        except Exception:
+            pass
+
+        try:
+            response = requests.get(
+                base_url + "/health",
+                headers=headers,
+                timeout=min(max(int(timeout), 1), 10),
+            )
+            if response.ok:
+                info["health"] = "ok"
+        except Exception:
+            pass
+
+        return info
+
     def _detect_reranker_model(self, reranker_endpoint, headers, reranker_model, timeout):
         reranker_model = str(reranker_model or "").strip()
         if reranker_model:
-            return reranker_model, "configured"
+            return reranker_model, "configured", []
 
         base_url = self._reranker_base_url(reranker_endpoint)
         if not base_url:
-            return "", "none"
+            return "", "none", []
 
         try:
             response = requests.get(
@@ -712,11 +749,11 @@ class LLMImageSelectorNode:
             if models:
                 model_id = str(models[0].get("id", "")).strip()
                 if model_id:
-                    return model_id, "v1/models"
+                    return model_id, "v1/models", models
         except Exception:
             pass
 
-        return "", "none"
+        return "", "none", []
 
     def _reranker_payload(self, query, documents, reranker_model="", top_n=0):
         payload = {
@@ -774,18 +811,21 @@ class LLMImageSelectorNode:
 
     def _probe_reranker(self, reranker_endpoint, headers, reranker_model, timeout):
         urls = self._reranker_urls(reranker_endpoint)
-        resolved_model, model_source = self._detect_reranker_model(
+        server_info = self._detect_reranker_server(reranker_endpoint, headers, timeout)
+        resolved_model, model_source, models = self._detect_reranker_model(
             reranker_endpoint,
             headers,
             reranker_model,
             timeout,
         )
+        server_info["models"] = models
         info = {
             "enabled": bool(urls),
             "available": False,
             "url": "",
             "model": resolved_model,
             "model_source": model_source,
+            "server": server_info,
             "provider": "unknown",
             "error": "",
         }
@@ -811,12 +851,14 @@ class LLMImageSelectorNode:
                 if scores:
                     info["available"] = True
                     info["url"] = url
-                    if url.endswith("/v1/rerank") and isinstance(response.json(), list):
+                    if url.endswith("/v2/rerank"):
+                        info["provider"] = "vllm_v2_or_cohere_style"
+                    elif url.endswith("/v1/rerank") and isinstance(response.json(), list):
                         info["provider"] = "sglang_or_vllm_style"
                     elif url.endswith("/v1/rerank"):
-                        info["provider"] = "llamacpp_or_openai_style"
+                        info["provider"] = "vllm_llamacpp_or_openai_style"
                     elif "reranking" in url or url.endswith("/rerank"):
-                        info["provider"] = "llamacpp_style"
+                        info["provider"] = "vllm_llamacpp_style"
                     return url, resolved_model, info
                 info["error"] = f"{url}: response did not contain rerank scores"
             except Exception as exc:
