@@ -570,6 +570,29 @@ class LLMImageSelectorNode:
                     "max": 100,
                     "step": 1
                 }),
+                "history_file": ("STRING", {
+                    "multiline": False,
+                    "default": "",
+                    "placeholder": "/path/to/selection_history.json (leave empty to disable)"
+                }),
+                "history_penalty": ("FLOAT", {
+                    "default": 10.0,
+                    "min": 0.0,
+                    "max": 50.0,
+                    "step": 0.5
+                }),
+                "history_max_entries": ("INT", {
+                    "default": 200,
+                    "min": 10,
+                    "max": 10000,
+                    "step": 10
+                }),
+                "reranker_blend_weight": ("FLOAT", {
+                    "default": 0.3,
+                    "min": 0.0,
+                    "max": 1.0,
+                    "step": 0.05
+                }),
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -1236,6 +1259,218 @@ class LLMImageSelectorNode:
 
         return _pil_image_to_comfy_image(candidate_pil_images[zero_index])
 
+    def _load_selection_history(self, history_file):
+        """Load the selection history JSON file. Returns {'selections': [], 'total_selections': 0}."""
+        path = str(history_file or "").strip()
+        if not path:
+            return {"selections": [], "total_selections": 0}
+
+        history_path = Path(path).expanduser()
+        if not history_path.exists():
+            return {"selections": [], "total_selections": 0}
+
+        try:
+            with open(history_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not isinstance(data, dict):
+                return {"selections": [], "total_selections": 0}
+            selections = data.get("selections")
+            if not isinstance(selections, list):
+                selections = []
+            return {
+                "selections": selections,
+                "total_selections": data.get("total_selections", len(selections)),
+            }
+        except (json.JSONDecodeError, OSError):
+            return {"selections": [], "total_selections": 0}
+
+    def _save_selection_history(self, history_file, history, max_entries):
+        """Save the selection history JSON file, trimming to max_entries."""
+        path = str(history_file or "").strip()
+        if not path:
+            return
+
+        history_path = Path(path).expanduser()
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+
+        selections = history.get("selections", [])
+        max_entries = max(10, int(max_entries))
+        if len(selections) > max_entries:
+            selections = selections[-max_entries:]
+
+        data = {
+            "selections": selections,
+            "total_selections": history.get("total_selections", len(selections)),
+        }
+        try:
+            with open(history_path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass  # silently ignore write failures — don't break the workflow
+
+    def _candidate_history_key(self, source):
+        """Build a stable string key for a candidate source for history tracking."""
+        if source.get("type") == "directory":
+            return source.get("path", "")
+        if source.get("type") == "input_batch":
+            return f"input_batch:{source.get('batch_index', 0)}"
+        if source.get("type") == "image_input":
+            return f"image_input:{source.get('batch_index', 0)}"
+        return json.dumps(source, ensure_ascii=False, sort_keys=True)
+
+    def _blend_reranker_scores(self, scores_by_id, candidate_sources, reranker_selection, blend_weight):
+        """
+        Blend LLM visual scores with reranker text-relevance scores.
+
+        When a reranker was used to pre-filter candidates, its relevance scores
+        carry signal about text-to-filename/folder match quality. Blending them
+        with the LLM's visual scores produces a more robust combined ranking.
+
+        Reranker scores are normalized to 0-100, then blended:
+          blended = (1 - w) * llm_score + w * reranker_score_normalized
+
+        Returns dict of {candidate_id: blended_score} and blend_info.
+        """
+        blend_weight = max(0.0, min(1.0, float(blend_weight)))
+        if blend_weight <= 0.0:
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        if not reranker_selection or not reranker_selection.get("used"):
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        reranker_scores = reranker_selection.get("scores", [])
+        if not reranker_scores:
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        # Build lookup: candidate_key -> reranker_score
+        # The reranker scores reference the ORIGINAL (pre-filter) candidate list,
+        # but candidate_sources now contains the FILTERED subset. The source
+        # objects are the same Python objects, so we match by identity key.
+        reranker_by_key = {}
+        for entry in reranker_scores:
+            source = entry.get("source", {})
+            key = self._candidate_history_key(source)
+            score = float(entry.get("score", 0.0))
+            if key:
+                # Keep the highest score if multiple entries for same key
+                if key not in reranker_by_key or score > reranker_by_key[key]:
+                    reranker_by_key[key] = score
+
+        if not reranker_by_key:
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        # Normalize reranker scores to 0-100
+        all_reranker_scores = list(reranker_by_key.values())
+        min_r = min(all_reranker_scores)
+        max_r = max(all_reranker_scores)
+        score_range = max_r - min_r
+
+        blend_info = {}
+        blended_scores = {}
+
+        for candidate_id, record in scores_by_id.items():
+            source = candidate_sources[candidate_id - 1]
+            key = self._candidate_history_key(source)
+            llm_score = record["score"]
+
+            reranker_raw = reranker_by_key.get(key)
+            if reranker_raw is None:
+                blended_scores[candidate_id] = llm_score
+                continue
+
+            # Normalize to 0-100
+            if score_range > 0.0:
+                reranker_normalized = ((reranker_raw - min_r) / score_range) * 100.0
+            else:
+                reranker_normalized = 50.0  # all same score → neutral
+
+            blended = (1.0 - blend_weight) * llm_score + blend_weight * reranker_normalized
+            blended = round(max(0.0, min(100.0, blended)), 2)
+
+            blended_scores[candidate_id] = blended
+            blend_info[candidate_id] = {
+                "llm_score": llm_score,
+                "reranker_raw": round(reranker_raw, 4),
+                "reranker_normalized": round(reranker_normalized, 2),
+                "blended_score": blended,
+                "blend_weight": blend_weight,
+            }
+
+        return blended_scores, blend_info
+
+    def _apply_history_penalty(self, scores_by_id, candidate_sources, history, history_penalty):
+        """
+        Adjust scores for previously-selected images using a gentle decay penalty.
+
+        The penalty decays by position in history (most recent = strongest penalty).
+        Formula: penalty = base_penalty * decay_factor
+          decay_factor = 1.0 / (1.0 + position_in_history * 0.5)
+
+        A candidate that was selected 4 rounds ago gets ~33% of the full penalty,
+        so a genuinely much better match will still win.
+
+        Returns a dict of {candidate_id: adjusted_score} and a penalty_info dict.
+        """
+        history_penalty = max(0.0, float(history_penalty))
+        if history_penalty <= 0.0:
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        selections = history.get("selections", [])
+        if not selections:
+            return {cid: rec["score"] for cid, rec in scores_by_id.items()}, {}
+
+        # Build a lookup: key -> list of positions in history (0 = most recent)
+        # selections are ordered oldest-first, so reverse to get newest-first
+        key_positions = {}
+        for pos, entry in enumerate(reversed(selections)):
+            key = entry.get("key", "")
+            if key:
+                if key not in key_positions:
+                    key_positions[key] = []
+                key_positions[key].append(pos)
+
+        penalty_info = {}
+        adjusted_scores = {}
+
+        for candidate_id, record in scores_by_id.items():
+            source = candidate_sources[candidate_id - 1]
+            key = self._candidate_history_key(source)
+            original_score = record["score"]
+
+            positions = key_positions.get(key, [])
+            if not positions:
+                adjusted_scores[candidate_id] = original_score
+                continue
+
+            # Use the most recent position (smallest index in reversed list)
+            most_recent_pos = min(positions)
+            # Also count how many times it appears
+            usage_count = min(len(positions), 5)  # cap at 5 to avoid over-penalizing
+
+            # Decay: position 0 → 1.0, position 1 → 0.67, position 2 → 0.5, position 3 → 0.4, ...
+            decay_factor = 1.0 / (1.0 + most_recent_pos * 0.5)
+            # Frequency factor: 1 use → 1.0, 3 uses → 1.5, 5+ uses → 1.8 (gentle cap)
+            freq_factor = 1.0 + min(usage_count - 1, 4) * 0.2
+
+            effective_penalty = history_penalty * decay_factor * freq_factor
+            effective_penalty = min(effective_penalty, history_penalty * 2.0)  # hard cap at 2x base
+
+            adjusted_score = max(0.0, original_score - effective_penalty)
+
+            adjusted_scores[candidate_id] = adjusted_score
+            penalty_info[candidate_id] = {
+                "original_score": original_score,
+                "adjusted_score": round(adjusted_score, 2),
+                "penalty": round(effective_penalty, 2),
+                "decay_factor": round(decay_factor, 3),
+                "freq_factor": round(freq_factor, 2),
+                "most_recent_position": most_recent_pos,
+                "usage_count": usage_count,
+                "key": key,
+            }
+
+        return adjusted_scores, penalty_info
+
     def select_image(
         self,
         prompt,
@@ -1258,6 +1493,10 @@ class LLMImageSelectorNode:
         reranker_endpoint,
         reranker_model,
         reranker_subdirectory_count,
+        history_file,
+        history_penalty,
+        history_max_entries,
+        reranker_blend_weight,
         image=None,
         candidate_images=None,
         reference_image=None,
@@ -1273,6 +1512,9 @@ class LLMImageSelectorNode:
         )
         max_images_per_call = max(1, min(int(max_images_per_call), 32))
         grid_columns = max(1, min(int(grid_columns), 8))
+
+        # --- selection history tracking ---
+        selection_history = self._load_selection_history(history_file)
 
         reference_parts = []
         if reference_image is not None:
@@ -1475,12 +1717,38 @@ class LLMImageSelectorNode:
             failure_text = json.dumps(failures, ensure_ascii=False, indent=2)
             raise RuntimeError(f"All LLM image selection chunks failed: {failure_text}")
 
-        best_record = max(
-            scores_by_id.values(),
-            key=lambda item: (item["score"], -item["zero_based_index"]),
+        # --- blend reranker text-relevance scores with LLM visual scores ---
+        blended_scores, blend_info = self._blend_reranker_scores(
+            scores_by_id,
+            candidate_sources,
+            reranker_candidate_selection,
+            reranker_blend_weight,
         )
+        # Update scores_by_id in-place: "score" becomes blended, "score_llm" keeps original
+        blend_applied = bool(blend_info)
+        if blend_applied:
+            for candidate_id, blended in blended_scores.items():
+                record = scores_by_id[candidate_id]
+                record["score_llm"] = record["score"]  # preserve original LLM score
+                record["score"] = blended
+
+        # --- apply selection history penalty for variation ---
+        adjusted_scores, penalty_info = self._apply_history_penalty(
+            scores_by_id,
+            candidate_sources,
+            selection_history,
+            history_penalty,
+        )
+
+        # Pick best based on adjusted scores (with tiebreaker on original score)
+        best_id = max(
+            adjusted_scores,
+            key=lambda cid: (adjusted_scores[cid], scores_by_id[cid]["score"]),
+        )
+        best_record = scores_by_id[best_id]
         best_index = int(best_record["zero_based_index"])
-        best_score = float(best_record["score"])
+        best_score_original = float(best_record["score"])
+        best_score_adjusted = round(float(adjusted_scores[best_id]), 2)
         best_image = self._select_original_candidate(
             image,
             candidate_images,
@@ -1489,10 +1757,22 @@ class LLMImageSelectorNode:
             best_index,
         )
 
+        # --- update selection history ---
+        best_key = self._candidate_history_key(candidate_sources[best_index])
+        selection_history.setdefault("selections", []).append({
+            "key": best_key,
+            "original_score": best_score_original,
+            "adjusted_score": best_score_adjusted,
+            "source": candidate_sources[best_index],
+        })
+        selection_history["total_selections"] = selection_history.get("total_selections", 0) + 1
+        self._save_selection_history(history_file, selection_history, history_max_entries)
+
         scores_payload = {
             "best_index": best_index,
             "best_id": best_index + 1,
-            "best_score": best_score,
+            "best_score": best_score_adjusted,
+            "best_score_original": best_score_original,
             "best_source": candidate_sources[best_index],
             "candidate_count": candidate_count,
             "original_candidate_count": original_candidate_count,
@@ -1507,6 +1787,21 @@ class LLMImageSelectorNode:
             "reranker_candidate_selection": reranker_candidate_selection,
             "recursive_directory": bool(recursive_directory),
             "scored_count": len(scores_by_id),
+            "history_penalty_applied": bool(penalty_info),
+            "history_penalty_config": {
+                "history_file": str(history_file or "").strip(),
+                "history_penalty": float(history_penalty),
+                "history_total_selections": selection_history.get("total_selections", 0),
+                "history_entries": len(selection_history.get("selections", [])),
+            },
+            "penalty_details": penalty_info,
+            "reranker_blend_applied": blend_applied,
+            "reranker_blend_config": {
+                "reranker_blend_weight": float(reranker_blend_weight),
+                "reranker_used": bool(reranker_candidate_selection and reranker_candidate_selection.get("used")),
+                "reranker_available": bool(reranker_url),
+            },
+            "reranker_blend_details": blend_info,
             "candidates": [
                 scores_by_id[candidate_id]
                 for candidate_id in sorted(scores_by_id.keys())
@@ -1518,7 +1813,7 @@ class LLMImageSelectorNode:
             best_image,
             candidate_batch,
             best_index,
-            best_score,
+            best_score_adjusted,
             json.dumps(scores_payload, ensure_ascii=False, indent=2),
             json.dumps(raw_responses, ensure_ascii=False, indent=2),
         )
