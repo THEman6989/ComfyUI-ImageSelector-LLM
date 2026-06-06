@@ -321,18 +321,21 @@ class BeatDropSelectorNode:
 
         prompt_text = (
             f"Beatdrop window at t={beat_time}s (drop={is_drop}). "
-            f"This window contains {frame_count} frames. "
-            f"Each frame is labeled with its 1-based index in the contact sheet. "
-            f"Select the {window_info.get('max_frames', 4)} best frames for outfit analysis. "
+            f"Select the {window_info.get('max_frames', 4)} best frames. "
             f"You MUST select at least {window_info.get('num_outfits', 2)} VISIBLY DIFFERENT outfits.\n"
         )
-        # Inject extra_instructions if provided
+        # Inject Re-Ranker + History scores
+        score_ctx = str(window_info.get('score_context', '')).strip()
+        if score_ctx:
+            prompt_text += f"\n{score_ctx}\n\n"
+            prompt_text += "Use these scores as guidance but make your own visual judgment.\n"
+        # Inject extra_instructions
         extra = str(window_info.get('extra_instructions', '')).strip()
         if extra:
             prompt_text += f"\nADDITIONAL INSTRUCTIONS:\n{extra}\n"
 
-        prompt_text += "Return ONLY valid JSON:\n"
-        prompt_text += '{"selected_ids": [1, 3, 5], "confidence": 0.85, "reason": "..."}'
+        prompt_text += "\nReturn ONLY valid JSON:\n"
+        prompt_text += '{"selected_ids": [frame_index, ...], "confidence": 0.85, "reason": "..."}'
 
         content = [
             {"type": "text", "text": prompt_text},
@@ -983,13 +986,29 @@ class BeatDropSelectorNode:
                 # LLM judging (optional)
                 if use_llm and endpoint and model:
                     try:
-                        win_frames = reference_frames[win["batch_start"]:win["batch_end"]]
-                        win_pils = _image_batch_to_pil_images(win_frames)
-                        labels = [str(i + 1) for i in range(len(win_pils))]
-                        cs_sheet = _build_contact_sheet(win_pils, grid_columns, labels if add_id_labels else None)
+                        # Build contact sheet from TOP-K candidates only (not all frames!)
+                        top_k_frames = [fidx for fidx, _ in scored[:max(w_n, min(len(scored), n_per_window * 2))]]
+                        top_k_tensor = reference_frames[torch.tensor(top_k_frames, dtype=torch.long)]
+                        top_k_pils = _image_batch_to_pil_images(top_k_tensor)
+                        # Labels show actual frame indices so LLM can reference them
+                        labels = [str(fidx) for fidx in top_k_frames]
+                        cs_sheet = _build_contact_sheet(top_k_pils, grid_columns, labels if add_id_labels else None)
+
+                        # Build context for LLM: scores + penalties
+                        ctx_lines = [f"Top candidates (Re-Ranker + History scored):"]
+                        for fidx, s in scored[:min(len(scored), 15)]:
+                            rr_s = reranker_scores.get(fidx, 0)
+                            ctx_lines.append(f"  Frame {fidx}: penalty={s:.1f}, reranker={rr_s:.1f}")
+                        score_context = "\n".join(ctx_lines)
+
                         raw = self._llm_judge_window(
                             endpoint, llm_headers, model, system_prompt,
-                            cs_sheet, {**wr, "max_frames": w_n},
+                            cs_sheet, {
+                                **wr, "max_frames": w_n,
+                                "score_context": score_context,
+                                "num_outfits": num_outfits,
+                                "extra_instructions": str(extra_instructions or "").strip(),
+                            },
                             max_tokens, temperature, timeout,
                         )
                         raw_resps.append(raw)
@@ -997,7 +1016,8 @@ class BeatDropSelectorNode:
                             parsed = json.loads(re.sub(r'```.*', '', raw).strip())
                             llm_ids = parsed.get("selected_ids", [])
                             if llm_ids:
-                                llm_sel = [indices[i - 1] for i in llm_ids if 1 <= i <= len(indices)]
+                                # LLM returns frame indices (from labels) — validate against top_k_frames
+                                llm_sel = [fid for fid in llm_ids if fid in top_k_frames]
                                 if llm_sel:
                                     wr["selected"] = llm_sel
                                     wr["selected_count"] = len(llm_sel)
