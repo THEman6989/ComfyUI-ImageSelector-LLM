@@ -117,6 +117,8 @@ class BeatDropSelectorNode:
                 "history_file": ("STRING", {"default": "", "multiline": False,
                     "placeholder": "/path/to/selection_history.json"}),
                 "history_penalty": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 50.0, "step": 0.5}),
+                "history_decay_rate": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 2.0, "step": 0.05,
+                    "tooltip": "How fast history penalty decays. 0.1=slow (frames stay penalized longer). 1.0=fast (frames cycle quickly)."}),
                 "history_max_entries": ("INT", {"default": 200, "min": 10, "max": 10000, "step": 10}),
                 # Re-ranker
                 "reranker_endpoint": ("STRING", {"default": "", "multiline": False,
@@ -179,7 +181,7 @@ class BeatDropSelectorNode:
     def _history_key(self, frame_idx):
         return f"beatdrop_frame_{int(frame_idx)}"
 
-    def _history_penalty_for(self, frame_idx, history, base_penalty):
+    def _history_penalty_for(self, frame_idx, history, base_penalty, decay_rate=0.3):
         if base_penalty <= 0:
             return 0.0
         selections = history.get("selections", [])
@@ -194,9 +196,13 @@ class BeatDropSelectorNode:
             return 0.0
         most_recent = min(positions)
         count = min(len(positions), 5)
-        decay = 1.0 / (1.0 + most_recent * 0.5)
-        freq = 1.0 + min(count - 1, 4) * 0.2
-        return min(base_penalty * decay * freq, base_penalty * 2.0)
+        # decay_rate controls speed: 0.1=slow, 1.0=fast
+        # decay = 1/(1 + most_recent * decay_rate)
+        # After 10 other selections at rate 0.3: decay=1/(1+3)=0.25 (75% penalty gone)
+        # After 10 other selections at rate 0.1: decay=1/(1+1)=0.50 (50% penalty gone)
+        decay = 1.0 / (1.0 + most_recent * max(0.05, float(decay_rate)))
+        freq = 1.0 + min(count - 1, 4) * 0.15  # capped at 1.6x for repeated selection
+        return min(base_penalty * decay * freq, base_penalty * 1.5)
 
     # ── Re-ranker (compact, same logic as LLMImageSelectorNode) ──────
 
@@ -313,6 +319,7 @@ class BeatDropSelectorNode:
                system_prompt="", max_tokens=512, temperature=0.0,
                timeout=120, grid_columns=4, add_id_labels=True,
                history_file="", history_penalty=10.0, history_max_entries=200,
+               history_decay_rate=0.3,
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
                reranker_top_k=12, reranker_query="",
                extra_instructions=""):
@@ -394,10 +401,11 @@ class BeatDropSelectorNode:
             if api_token:
                 reranker_headers["Authorization"] = f"Bearer {api_token}"
             query = str(reranker_query or "").strip() or (
-                "Outfits that are VISIBLY DIFFERENT from each other in overall vibe — "
-                "different silhouette, different cut and shape, different style. "
-                "The change should be immediately noticeable: the eye should see "
-                "a completely different look when the beat drops."
+                "Find outfits that fit TWO criteria simultaneously:\n"
+                "1) SCENE FIT: Does this outfit match the scene lighting, pose, camera angle, vibe?\n"
+                "2) CHANGE STRENGTH: Is this outfit VISIBLY DIFFERENT from the old outfit — "
+                "different silhouette, cut, shape, style — so the change is immediately noticeable?\n"
+                "Outfits that fail EITHER criterion should score low."
             )
             documents = [f"Frame {i}: beatdrop candidate image" for i in range(B)]
             rr = self._run_reranker(
@@ -438,7 +446,7 @@ class BeatDropSelectorNode:
                     for key, val in penalties_to_apply.items():
                         if str(fidx) in str(key):
                             s += float(val)
-                    hist_pen = self._history_penalty_for(fidx, history, float(history_penalty))
+                    hist_pen = self._history_penalty_for(fidx, history, float(history_penalty), float(history_decay_rate))
                     s += hist_pen
                     if fidx in reranker_scores and blend_w > 0:
                         rr_score = reranker_scores[fidx]
@@ -550,6 +558,7 @@ class BeatDropSelectorNode:
             "use_llm": use_llm,
             "penalty_shift": round(max(0.0, min(1.0, float(penalty))), 2),
             "history_penalty": float(history_penalty),
+            "history_decay_rate": float(history_decay_rate),
             "reranker_used": bool(reranker_scores),
             "reranker_blend_weight": round(blend_w, 2),
             "reranker_frames_scored": len(reranker_scores),
