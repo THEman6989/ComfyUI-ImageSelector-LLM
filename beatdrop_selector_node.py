@@ -143,6 +143,8 @@ class BeatDropSelectorNode:
                     "tooltip": "Root folder with outfit subdirectories. Vision LLM selects which folders to use."}),
                 "max_candidate_images": ("INT", {"default": 30, "min": 5, "max": 500, "step": 5,
                     "tooltip": "Max images to load from selected folders. Pre-filtered by history + random sample."}),
+                "use_random_sample": ("BOOLEAN", {"default": True,
+                    "tooltip": "Randomly sample from history-filtered pool. OFF = take best by history score only."}),
             },
         }
 
@@ -417,8 +419,14 @@ class BeatDropSelectorNode:
         return [name for name, _ in folders]
 
     def _load_filtered_candidates(self, folders, selected_names, max_images,
-                                    history, history_penalty, decay_rate):
-        """Load images from selected folders, filter by history, random sample."""
+                                    history, history_penalty, decay_rate,
+                                    use_random):
+        """Load ALL images from selected folders, score by history, optionally random-sample.
+
+        All images are loaded and passed to the Re-Ranker. History filtering just
+        down-ranks recently-used images; they still participate but with penalty.
+        max_images caps the total. use_random=True randomly picks from the top pool.
+        """
         import random, numpy as np
 
         # Collect all image paths from selected folders
@@ -428,50 +436,50 @@ class BeatDropSelectorNode:
                 all_paths.extend([(name, p) for p in paths])
 
         if not all_paths:
-            return None, []
+            return None, [], []
 
-        # Apply history filter: compute penalty for each image, exclude heavily penalized
+        # Score by history: use the SAME history system as frame indices
+        # History key = file stem, tracked in the shared history file
         scored_paths = []
         for folder_name, path in all_paths:
-            # Use file path hash as frame key for history
-            frame_key = f"folder_{folder_name}_{Path(path).stem}"
-            hist_pen = 0.0
-            # Check if this image was recently selected
-            for entry in reversed(history.get("selections", [])[-50:]):
-                if entry.get("key") == frame_key:
-                    hist_pen = self._history_penalty_for(
-                        hash(frame_key) % 10000, history, float(history_penalty), float(decay_rate),
-                    )
-                    break
+            hist_key = f"folder_{Path(path).stem}"
+            hist_pen = self._history_penalty_for(
+                hash(hist_key) % 100000, history, float(history_penalty), float(decay_rate),
+            )
             scored_paths.append((folder_name, path, hist_pen))
 
-        # Sort by penalty (low = less penalized = preferred)
+        # Sort by penalty (low = less penalized = preferred, fresh images first)
         scored_paths.sort(key=lambda x: x[2])
 
-        # Take up to max_images, but randomize within acceptable range
+        # Cap at max_images
         max_img = min(int(max_images), len(scored_paths))
-        # Take top 2/3 by score, then random from those
-        pool_size = min(len(scored_paths), max(int(max_img * 1.5), max_img))
-        pool = scored_paths[:pool_size]
-        selected = random.sample(pool, min(max_img, len(pool)))
 
-        # Load images into tensor
+        if use_random:
+            # Random sample from top 2x pool (keeps variety)
+            pool_size = min(len(scored_paths), max(int(max_img * 2), max_img))
+            pool = scored_paths[:pool_size]
+            selected = random.sample(pool, min(max_img, len(pool)))
+        else:
+            # Take best by score (no randomness — deterministic, freshest images win)
+            selected = scored_paths[:max_img]
+
+        # Load images into uniform tensor
         loaded = []
         folder_map = {}
         for idx, (fname, path, penalty) in enumerate(selected):
             try:
                 pil_img = Image.open(path).convert("RGB")
                 arr = np.array(pil_img, dtype=np.float32) / 255.0
-                tensor = torch.from_numpy(arr)  # (H, W, 3)
+                tensor = torch.from_numpy(arr)
                 loaded.append(tensor)
                 folder_map[idx] = fname
             except Exception:
                 continue
 
         if not loaded:
-            return None, []
+            return None, [], []
 
-        # Stack to uniform size (resize all to match first image)
+        # Resize all to match first image
         h, w = loaded[0].shape[:2]
         uniform = []
         for t in loaded:
@@ -482,20 +490,22 @@ class BeatDropSelectorNode:
                 ).squeeze(0).permute(1, 2, 0)
             uniform.append(t)
 
-        images_tensor = torch.stack(uniform, dim=0)  # (N, H, W, 3)
+        images_tensor = torch.stack(uniform, dim=0)
         folder_list = [folder_map.get(i, "unknown") for i in range(len(selected))]
-        return images_tensor, folder_list
+        # Also track image stems for history recording
+        image_stems = [Path(selected[i][1]).stem for i in range(len(selected))]
+        return images_tensor, folder_list, image_stems
 
     def _load_from_folders(self, root_path, endpoint, api_token, model,
                            history_file, history_penalty, decay_rate,
-                           extra_instructions, timeout, max_images):
+                           extra_instructions, timeout, max_images,
+                           use_random):
         """Full folder-based loading pipeline: scan → LLM-select → pre-filter → load."""
         import requests
         folders = self._scan_folders(root_path)
         if not folders:
             return None, {"error": "no subdirectories with images found"}
 
-        # LLM folder selection
         headers = {"Content-Type": "application/json"}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
@@ -510,10 +520,10 @@ class BeatDropSelectorNode:
         if not selected_folders:
             selected_folders = [name for name, _ in folders]
 
-        # Load + pre-filter
-        images, folder_list = self._load_filtered_candidates(
+        images, folder_list, image_stems = self._load_filtered_candidates(
             folders, selected_folders, max_images,
             history, history_penalty, decay_rate,
+            use_random,
         )
 
         info = {
@@ -523,6 +533,9 @@ class BeatDropSelectorNode:
             "folders_selected": selected_folders,
             "images_loaded": images.shape[0] if images is not None else 0,
             "max_candidate_images": int(max_images),
+            "use_random_sample": bool(use_random),
+            "_folder_list": folder_list if images is not None else [],
+            "_image_stems": image_stems if images is not None else [],
         }
         return images, info
 
@@ -539,7 +552,8 @@ class BeatDropSelectorNode:
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
                reranker_top_k=12, reranker_query="",
                extra_instructions="",
-               candidate_folders="", max_candidate_images=30):
+               candidate_folders="", max_candidate_images=30,
+               use_random_sample=True):
 
         folder_info = None  # populated when loading from folders
 
@@ -551,6 +565,7 @@ class BeatDropSelectorNode:
                     folder_path, endpoint, api_token, model,
                     history_file, history_penalty, history_decay_rate,
                     extra_instructions, timeout, max_candidate_images,
+                    use_random_sample,
                 )
                 if images is None:
                     return ("", 0, json.dumps({"error": "no images in folders", "folders_scanned": folder_path}),
@@ -756,12 +771,25 @@ class BeatDropSelectorNode:
             all_selected, window_results, raw_responses = _run_selection(extra_penalties)
             correction_info = {"judge_corrections_applied": False}
 
-        # Record history for selected frames
+        # Record history for selected frames (frame indices + folder images)
         for fidx in all_selected:
             history.setdefault("selections", []).append({
                 "key": self._history_key(fidx),
                 "frame": int(fidx),
             })
+        # Also record folder-based images in shared history
+        if folder_info and folder_info.get("source") == "folders":
+            stems = folder_info.get("_image_stems", [])
+            for fidx in all_selected:
+                if 0 <= fidx < len(stems):
+                    stem = stems[fidx]
+                    # Use SAME key format as _history_key so lookup matches
+                    hist_key = self._history_key(hash(f"folder_{stem}") % 100000)
+                    history.setdefault("selections", []).append({
+                        "key": hist_key,
+                        "frame": -1,
+                        "folder_stem": stem,
+                    })
         history["total_selections"] = len(history.get("selections", []))
         self._save_history(history_file, history, history_max_entries)
 
