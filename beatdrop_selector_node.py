@@ -686,6 +686,16 @@ class BeatDropSelectorNode:
         for w in windows:
             job_mask[w["batch_start"]:w["batch_end"]] = True
 
+        # ── Merge context frames (outside windows, low fps) ──
+        if context_frames is not None and isinstance(context_frames, torch.Tensor):
+            ctx_B = context_frames.shape[0]
+            if ctx_B > 0:
+                # Context frames are OUTSIDE job windows → job_mask = False
+                ctx_mask = torch.zeros(ctx_B, dtype=torch.bool)
+                reference_frames = torch.cat([reference_frames, context_frames], dim=0)
+                job_mask = torch.cat([job_mask, ctx_mask], dim=0)
+                B = reference_frames.shape[0]
+
         # ── Downsample if exceeding max_total_frames ──
         if B > max_total:
             reference_frames, job_mask = self._downsample_frames(

@@ -17,6 +17,7 @@ import torch
 from pathlib import Path
 from PIL import Image
 import numpy as np
+import torch.nn.functional as F
 
 # Reuse helpers from openai_llm_node
 try:
@@ -180,6 +181,15 @@ class AlphaRavisOutfitReferenceJudgeNode:
                 "add_id_labels": ("BOOLEAN", {
                     "default": True,
                 }),
+                # Frame management
+                "image_resolution": ("INT", {
+                    "default": 512, "min": 64, "max": 2048, "step": 64,
+                    "tooltip": "Max pixel dimension before sending to Vision LLM",
+                }),
+                "max_candidate_frames": ("INT", {
+                    "default": 50, "min": 5, "max": 500, "step": 5,
+                    "tooltip": "Max candidate images before downsampling. Exceeding triggers uniform downsampling.",
+                }),
             },
         }
 
@@ -337,7 +347,8 @@ class AlphaRavisOutfitReferenceJudgeNode:
               embedding_change_json="{}", mask_quality_json="{}",
               conversation_id="", run_id="", drop_id="",
               api_token="", judge_prompt="", extra_instructions="",
-              grid_columns=4, add_id_labels=True):
+              grid_columns=4, add_id_labels=True,
+              image_resolution=512, max_candidate_frames=50):
 
         # ── Validate inputs ──
         if candidate_images is None or not isinstance(candidate_images, torch.Tensor):
@@ -350,6 +361,30 @@ class AlphaRavisOutfitReferenceJudgeNode:
             blank = _make_blank_image()
             return (blank, -1, "", '{"error":"empty candidate images"}',
                     0.0, 0.0, 0.0, True, "")
+
+        # ── Downsample if exceeding max_candidate_frames ──
+        max_cand = max(5, int(max_candidate_frames))
+        if N > max_cand:
+            import torch as _t
+            keep = _t.linspace(0, N - 1, max_cand).long()
+            candidate_images = candidate_images[keep]
+            N = candidate_images.shape[0]
+
+        # ── Resize for LLM ──
+        max_res = max(64, int(image_resolution))
+        resized = []
+        for i in range(N):
+            frame = candidate_images[i]
+            h, w = frame.shape[:2]
+            if h > max_res or w > max_res:
+                scale = max_res / max(h, w)
+                frame = F.interpolate(
+                    frame.permute(2, 0, 1).unsqueeze(0),
+                    size=(int(h * scale), int(w * scale)),
+                    mode="bilinear", align_corners=False,
+                ).squeeze(0).permute(1, 2, 0)
+            resized.append(frame)
+        candidate_images = torch.stack(resized, dim=0)
 
         endpoint = str(endpoint or "").strip()
         if not endpoint:
