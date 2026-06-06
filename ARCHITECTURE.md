@@ -113,6 +113,49 @@ penalty = base × decay × freq   (capped at base × 1.5)
 - `auto_from_beats`: `num_outfits = anzahl windows in beats_used` (min 2)
 - `manual`: Slider-Wert (min 2)
 
+### Folder-Based Candidate Loading (NEU)
+
+Statt IMAGE-Tensor direkt — aus Ordnerstruktur laden:
+
+```
+candidate_folders = "/path/to/outfits/"
+    │
+    ├── jackets/      (5 Bilder)
+    ├── no_jacket/    (5 Bilder)
+    ├── exotic/       (3 Bilder)
+    └── chill/        (4 Bilder)
+
+        │
+        ▼
+┌───────────────────────────┐
+│ 1. _scan_folders()        │
+│    → Liste aller Ordner   │
+│    + Bildpfade            │
+└───────────┬───────────────┘
+            │
+            ▼
+┌───────────────────────────┐
+│ 2. _select_folders_via_llm│  (wenn endpoint+model)
+│    3 Sample-Bilder/Ordner │
+│    → Vision LLM           │
+│    → selected_folders     │  z.B. ["jackets", "no_jacket"]
+│    extra_instructions mit │
+└───────────┬───────────────┘
+            │
+            ▼
+┌───────────────────────────┐
+│ 3. _load_filtered_candidates│
+│    History-Pre-Filter:    │  Bereits benutzte Bilder raus
+│    Random-Sample:         │  Top-Pool → zufällig max 30
+│    → images_tensor        │
+└───────────┬───────────────┘
+            │
+            ▼
+     Re-Ranker → Scoring-Loop (wie vorher)
+```
+
+Wenn kein `endpoint`/`model` gesetzt: alle Ordner werden benutzt (Fallback).
+
 ### Wichtige Inputs
 
 | Input | Default | Bedeutung |
