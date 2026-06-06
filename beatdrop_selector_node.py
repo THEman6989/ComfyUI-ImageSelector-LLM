@@ -375,7 +375,7 @@ class BeatDropSelectorNode:
 
     def _select_folders_via_llm(self, folders, endpoint, headers, model,
                                  extra_instructions, timeout,
-                                 scene_frames=None):
+                                 scene_frames=None, num_phases=2):
         """Send sample images from each folder + scene context to Vision LLM.
         Returns list of folder names to use, in order.
         scene_frames: video frames as context (what the scene looks like)"""
@@ -416,10 +416,16 @@ class BeatDropSelectorNode:
         content.append({
             "type": "text",
             "text": (
-                "Below are sample images from different outfit folders.\n"
-                "Decide which folder(s) to use and in what ORDER.\n\n"
-                "Consider: the outfits should create a VISIBLE CHANGE at the beatdrop AND fit the scene above.\n"
-                "For example: first a jacket outfit, then without jacket = strong change.\n\n"
+                f"Below are sample images from different outfit folders.\n"
+                f"There are {num_phases} phases (beatdrop windows).\n"
+                f"Assign one folder to EACH phase. The assignments must create a VISIBLE CHANGE.\n\n"
+                f"Example: Phase 0 = jackets, Phase 1 = no_jacket (strong contrast).\n"
+                f"Each folder can be used for at most one phase.\n\n"
+                f"Return ONLY valid JSON with this exact structure:\n"
+                f'{{"folder_assignments": [\n'
+                f'  {{"phase": 0, "folder": "jackets", "reason": "strong visible change from jacket to no-jacket"}},\n'
+                f'  {{"phase": 1, "folder": "no_jacket", "reason": "contrast after drop"}}\n'
+                f']}}\n'
             ),
         })
         if extra_instructions:
@@ -472,14 +478,32 @@ class BeatDropSelectorNode:
             choices = body.get("choices", [])
             text = choices[0].get("message", {}).get("content", "") if choices else ""
             parsed = json.loads(re.sub(r"```.*", "", text).strip())
+
+            # New format: folder_assignments (per-phase mapping)
+            assignments = parsed.get("folder_assignments", [])
+            if isinstance(assignments, list) and assignments:
+                # Validate folder names exist
+                valid_assignments = []
+                for a in assignments:
+                    fname = a.get("folder", "")
+                    if fname in folder_labels:
+                        valid_assignments.append(a)
+                if valid_assignments:
+                    return valid_assignments  # list of {phase, folder, reason}
+
+            # Fallback: old flat selected_folders format
             selected = parsed.get("selected_folders", [])
             if isinstance(selected, list) and selected:
-                # Validate against actual folder names
                 valid = [s for s in selected if s in folder_labels]
-                return valid if valid else [name for name, _ in folders]
+                if valid:
+                    # Wrap as per-phase assignments (assign in order)
+                    return [{"phase": i, "folder": f, "reason": "auto-assigned"}
+                            for i, f in enumerate(valid)]
         except Exception:
             pass
-        return [name for name, _ in folders]
+        # Ultimate fallback: all folders
+        return [{"phase": i, "folder": name, "reason": "fallback"}
+                for i, (name, _) in enumerate(folders)]
 
     def _load_filtered_candidates(self, folders, selected_names, max_images,
                                     history, history_penalty, decay_rate,
@@ -563,8 +587,12 @@ class BeatDropSelectorNode:
                            history_file, history_penalty, decay_rate,
                            extra_instructions, timeout, max_images,
                            use_random, scene_frames=None,
-                           conversation_id=""):
-        """Full folder-based loading pipeline: scan → LLM-select → pre-filter → load."""
+                           conversation_id="", num_windows=2):
+        """Full folder-based loading pipeline: scan → LLM-select → per-phase load.
+
+        Returns (images_tensor, info_dict) where images_tensor is all loaded images
+        and info includes 'folder_assignments' and 'phase_images' lists.
+        """
         import requests
         folders = self._scan_folders(root_path)
         if not folders:
@@ -578,34 +606,75 @@ class BeatDropSelectorNode:
             headers["x-thread-id"] = str(conversation_id)
 
         history = self._load_history(history_file)
-        selected_folders = []
+        num_phases = max(2, int(num_windows))
 
+        # LLM selects folders per phase
+        assignments = []
         if endpoint and model:
-            selected_folders = self._select_folders_via_llm(
+            assignments = self._select_folders_via_llm(
                 folders, endpoint, headers, model, extra_instructions, timeout,
-                scene_frames=scene_frames,
+                scene_frames=scene_frames, num_phases=num_phases,
             )
-        if not selected_folders:
-            selected_folders = [name for name, _ in folders]
+        if not assignments:
+            assignments = [{"phase": i, "folder": name, "reason": "fallback"}
+                          for i, (name, _) in enumerate(folders)]
 
-        images, folder_list, image_stems = self._load_filtered_candidates(
-            folders, selected_folders, max_images,
-            history, history_penalty, decay_rate,
-            use_random,
-        )
+        # Per-phase: load images from assigned folder
+        max_per_phase = max(2, int(max_images) // max(1, len(assignments)))
+        all_images = []
+        phase_info = []
+        folder_map_global = {}
+
+        for assignment in assignments:
+            phase = assignment.get("phase", 0)
+            folder_name = assignment.get("folder", "")
+            # Find matching folder paths
+            phase_paths = []
+            for fname, paths in folders:
+                if fname == folder_name:
+                    phase_paths = [(fname, p) for p in paths]
+                    break
+            if not phase_paths:
+                continue
+
+            # Load + filter for this phase
+            phase_images, phase_list, phase_stems = self._load_filtered_candidates(
+                [(folder_name, [p for _, p in phase_paths])], [folder_name],
+                max_per_phase, history, history_penalty, decay_rate, use_random,
+            )
+            if phase_images is not None:
+                offset = len(all_images)
+                all_images.append(phase_images)
+                for i, stem in enumerate(phase_stems or []):
+                    folder_map_global[offset + i] = folder_name
+                phase_info.append({
+                    "phase": phase,
+                    "folder": folder_name,
+                    "reason": assignment.get("reason", ""),
+                    "images_loaded": phase_images.shape[0],
+                })
+
+        if not all_images:
+            return None, {"error": "no images loaded from any folder"}
+
+        # Stack all phase images into one tensor
+        images_tensor = torch.cat(all_images, dim=0)
 
         info = {
             "source": "folders",
             "root": root_path,
             "folders_found": [name for name, _ in folders],
-            "folders_selected": selected_folders,
-            "images_loaded": images.shape[0] if images is not None else 0,
+            "folder_assignments": assignments,
+            "phase_info": phase_info,
+            "images_loaded": images_tensor.shape[0],
             "max_candidate_images": int(max_images),
+            "max_per_phase": max_per_phase,
             "use_random_sample": bool(use_random),
-            "_folder_list": folder_list if images is not None else [],
-            "_image_stems": image_stems if images is not None else [],
+            "_folder_list": [folder_map_global.get(i, "unknown")
+                            for i in range(images_tensor.shape[0])],
+            "_image_stems": [],  # stems are per-phase, simplified here
         }
-        return images, info
+        return images_tensor, info
 
     @staticmethod
     def _resize_frame(tensor, max_dim):
@@ -698,6 +767,13 @@ class BeatDropSelectorNode:
             # Try folder-based loading as fallback
             folder_path = str(candidate_folders or "").strip()
             if folder_path:
+                # Quick count of windows from beats_used
+                try:
+                    bu = json.loads(beats_used or "[]")
+                    nw = max(2, len(bu) if isinstance(bu, list) else 2)
+                except Exception:
+                    nw = 2
+
                 images, folder_info = self._load_from_folders(
                     folder_path, endpoint, api_token, model,
                     history_file, history_penalty, history_decay_rate,
@@ -705,10 +781,13 @@ class BeatDropSelectorNode:
                     use_random_sample,
                     scene_frames=reference_frames,
                     conversation_id=conversation_id,
+                    num_windows=nw,
                 )
                 if images is None:
                     return ("", 0, json.dumps({"error": "no images in folders", "folders_scanned": folder_path}),
                             _make_blank_image(), "")
+                # Replace reference_frames with folder-loaded images
+                reference_frames = images
             else:
                 return ("", 0, json.dumps({"error": "no images provided and no candidate_folders set"}),
                         _make_blank_image(), "")
