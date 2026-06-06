@@ -122,6 +122,12 @@ class AlphaRavisOutfitReferenceJudgeNode:
                     "default": 8, "min": 2, "max": 30, "step": 1,
                     "tooltip": "Candidates per contact-sheet chunk",
                 }),
+                "judge_mode": (["select_and_judge", "validate_only"], {"default": "validate_only",
+                    "tooltip": "select_and_judge: pick best outfit. validate_only: only pass/fail, return penalties for bad ones."}),
+                "validate_threshold": ("FLOAT", {
+                    "default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                    "tooltip": "Minimum composite score. Below = fail, return extra_penalty_json.",
+                }),
                 "temperature": ("FLOAT", {
                     "default": 0.0, "min": 0.0, "max": 2.0, "step": 0.1,
                 }),
@@ -342,7 +348,8 @@ class AlphaRavisOutfitReferenceJudgeNode:
 
     # ── Main judge ────────────────────────────────────────────────────
 
-    def judge(self, endpoint, model, max_images_per_call, temperature, timeout,
+    def judge(self, endpoint, model, max_images_per_call, judge_mode, validate_threshold,
+              temperature, timeout,
               candidate_images=None,
               reference_frames=None, context_frames=None,
               old_outfit_crop=None,
@@ -541,8 +548,63 @@ class AlphaRavisOutfitReferenceJudgeNode:
                 all_responses.append({"chunk": f"{chunk_start}-{chunk_end - 1}", "error": str(e)})
                 continue
 
-        # ── Merge and select best ──
+        # ── Merge and evaluate ──
         merged = self._merge_candidate_scores(all_candidate_scores)
+
+        if str(judge_mode) == "validate_only":
+            # ONLY validate — return pass/fail + extra_penalty_json for bad frames
+            threshold = max(0.0, min(1.0, float(validate_threshold)))
+            scored_all = []
+            for idx, cand in merged.items():
+                s = self._compute_weighted_score(cand)
+                scored_all.append((idx, cand, s))
+
+            scored_all.sort(key=lambda x: x[2], reverse=True)
+            best_score = scored_all[0][2] if scored_all else 0.0
+            passed = best_score >= threshold
+
+            # Build extra_penalty_json for candidates below threshold
+            extra_penalties = {}
+            for idx, cand, s in scored_all:
+                if s < threshold:
+                    # Penalty proportional to how far below threshold
+                    gap = threshold - s
+                    extra_penalties[str(idx)] = round(gap * 20.0, 1)  # scale to useful range
+
+            validate_result = {
+                "schema_version": 1,
+                "node": "AlphaRavisOutfitReferenceJudgeNode",
+                "source": "comfyui_researcher",
+                "mode": "validate_only",
+                "passed": passed,
+                "best_score": round(best_score, 4),
+                "threshold": round(threshold, 2),
+                "total_candidates": N,
+                "chunks_processed": len(all_responses),
+                "candidates_scored": len(merged),
+                "extra_penalty_json": extra_penalties,
+                "reason": f"Best score {best_score:.3f} {'≥' if passed else '<'} threshold {threshold:.2f}" if not passed else "All good",
+            }
+            if conversation_id:
+                validate_result["conversation_id"] = conversation_id
+            if run_id:
+                validate_result["run_id"] = run_id
+            if drop_id:
+                validate_result["drop_id"] = drop_id
+
+            judge_json = json.dumps(validate_result, indent=2)
+            return (
+                _make_blank_image(),
+                -1,
+                "",
+                judge_json,
+                round(best_score, 4) if passed else 0.0,
+                0.0, 0.0,
+                not passed,  # too_similar = !passed
+                json.dumps({"responses": all_responses, "candidates_scored": len(all_candidate_scores)}, indent=2),
+            )
+
+        # ── select_and_judge mode: pick best outfit ──
         best_result, _ = self._select_best(merged, all_responses)
 
         # ── Build outputs ──
