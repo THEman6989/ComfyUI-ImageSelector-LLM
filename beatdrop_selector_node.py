@@ -123,6 +123,11 @@ class BeatDropSelectorNode:
                     "placeholder": "http://127.0.0.1:8012 — vLLM/SGLang/llama.cpp reranker"}),
                 "reranker_model": ("STRING", {"default": "", "multiline": False,
                     "placeholder": "Auto-detected if empty"}),
+                "reranker_top_k": ("INT", {"default": 12, "min": 0, "max": 200, "step": 1,
+                    "tooltip": "Pre-filter: only top-K reranker candidates enter scoring loop. 0 = all pass through"}),
+                "reranker_query": ("STRING", {"default": "", "multiline": True,
+                    "placeholder": "Custom reranker query. Empty = auto: 'Outfits with strong visual difference, clear silhouette, beatdrop-suitable'",
+                    "tooltip": "What the reranker should look for in candidates"}),
                 "reranker_blend_weight": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How much to blend reranker scores (0=ignore, 1=full reranker)"}),
                 "extra_instructions": ("STRING", {"default": "", "multiline": True,
@@ -309,6 +314,7 @@ class BeatDropSelectorNode:
                timeout=120, grid_columns=4, add_id_labels=True,
                history_file="", history_penalty=10.0, history_max_entries=200,
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
+               reranker_top_k=12, reranker_query="",
                extra_instructions=""):
 
         if images is None or not isinstance(images, torch.Tensor):
@@ -325,6 +331,13 @@ class BeatDropSelectorNode:
             pass
         if not isinstance(extra_penalties, dict):
             extra_penalties = {}
+
+        # ── Judge feedback: internal retry when corrections exist ──
+        # If the Judge sent penalties, run selection once without them (discover
+        # what would be selected), then again with corrections applied. The second
+        # pass returns the corrected result.
+        has_judge_corrections = bool(extra_penalties)
+        correction_pass = False  # True during the second (corrected) run
 
         # Parse beats_used for window boundaries
         windows = []
@@ -372,17 +385,22 @@ class BeatDropSelectorNode:
             if api_token:
                 llm_headers["Authorization"] = f"Bearer {api_token}"
 
-        # ── Re-ranker: score all frames against a query (optional) ──
+        # ── Re-ranker: score all frames, pre-filter to top-K ──
         reranker_scores = {}
+        top_k_set = set()
+        top_k = max(0, int(reranker_top_k))
         if reranker_endpoint and reranker_endpoint.strip():
             reranker_headers = {"Content-Type": "application/json"}
             if api_token:
                 reranker_headers["Authorization"] = f"Bearer {api_token}"
-            query = "Select frames that best show the outfit or clothing change, with clear visibility of the person's attire."
+            query = str(reranker_query or "").strip() or (
+                "Outfits with strong visual difference from the old outfit, "
+                "clear silhouette, distinct color, suitable for a visible beatdrop change."
+            )
             documents = [f"Frame {i}: beatdrop candidate image" for i in range(B)]
             rr = self._run_reranker(
                 reranker_endpoint, reranker_headers, reranker_model,
-                query, documents, top_n=0, timeout=timeout,
+                query, documents, top_n=max(top_k, B), timeout=timeout,
             )
             if rr:
                 # Normalize reranker scores to 0-100 range
@@ -392,105 +410,109 @@ class BeatDropSelectorNode:
                 for idx, score in rr:
                     normalized = ((score - r_min) / r_range) * 100.0
                     reranker_scores[idx] = normalized
+                # Pre-filter: only top-K candidates proceed to scoring loop
+                if top_k > 0 and top_k < len(rr):
+                    for idx, _ in rr[:top_k]:
+                        top_k_set.add(idx)
 
         blend_w = max(0.0, min(1.0, float(reranker_blend_weight)))
 
-        # ── Select frames per window ──
-        all_selected = []
-        window_results = []
-        raw_responses = []
-
-        for wi, win in enumerate(windows):
-            indices = win["frame_indices"]
-            if not indices:
-                continue
-
-            # Score each frame in this window (Johnson history + extra penalties + reranker + diversity)
-            scored = []
-            for fidx in indices:
-                s = 0.0
-                # Extra penalties from Judge
-                for key, val in extra_penalties.items():
-                    if str(fidx) in str(key):
-                        s += float(val)
-                # Johnson history penalty
-                hist_pen = self._history_penalty_for(fidx, history, float(history_penalty))
-                s += hist_pen
-                # Reranker blend: higher reranker score = lower penalty (better frame)
-                if fidx in reranker_scores and blend_w > 0:
-                    # Invert: reranker 100 = best → 0 penalty, reranker 0 = worst → full penalty
-                    rr_score = reranker_scores[fidx]
-                    # Blend: (1-w)*hist_pen + w*(100 - rr_score)
-                    s = (1.0 - blend_w) * s + blend_w * (100.0 - rr_score)
-                # Diversity penalty: penalize frames too close to already-selected frames
-                # from previous windows (ensures outfits are from different video segments)
-                for prev_idx in all_selected:
-                    dist = abs(fidx - prev_idx)
-                    if dist < n_per_window:  # too close to an existing selection
-                        s += float(history_penalty) * (1.0 - dist / max(n_per_window, 1))
-                scored.append((fidx, s))
-
-            # Sort by penalty (lowest first = least penalized = best)
-            scored.sort(key=lambda x: x[1])
-
-            # Select top N
-            w_n = min(n_per_window, len(scored))
-            w_selected = [fidx for fidx, _ in scored[:w_n]]
-            all_selected.extend(w_selected)
-
-            wr = {
-                "drop_index": wi,
-                "beat_time": win.get("time_seconds"),
-                "frame_index": win.get("frame_index"),
-                "is_drop": win.get("is_drop", False),
-                "range_start": win.get("range_start"),
-                "range_end": win.get("range_end"),
-                "batch_start": win["batch_start"],
-                "batch_end": win["batch_end"],
-                "window_frames": len(indices),
-                "num_outfits": num_outfits,
-                "extra_instructions": str(extra_instructions or "").strip(),
-                "selected_count": len(w_selected),
-                "selected": w_selected,
-                "scores": [{"frame": fidx, "penalty": round(s, 2)}
-                           for fidx, s in scored[:max(w_n, min(10, len(scored)))]],
-            }
-
-            # LLM judging (optional)
-            if use_llm and endpoint and model:
-                try:
-                    # Build contact sheet for this window
-                    win_frames = images[win["batch_start"]:win["batch_end"]]
-                    win_pils = _image_batch_to_pil_images(win_frames)
-                    labels = [str(i + 1) for i in range(len(win_pils))]
-                    cs = _build_contact_sheet(win_pils, grid_columns, labels if add_id_labels else None)
-
-                    raw = self._llm_judge_window(
-                        endpoint, llm_headers, model, system_prompt,
-                        cs, {**wr, "max_frames": w_n},
-                        max_tokens, temperature, timeout,
-                    )
-                    raw_responses.append(raw)
-                    # Try to parse LLM selection
+        # ── Internal retry wrapper: if Judge sent corrections, run twice ──
+        # Pass 1: without corrections (discover baseline)
+        # Pass 2: with corrections (return corrected result)
+        def _run_selection(penalties_to_apply):
+            all_sel = []
+            win_results = []
+            raw_resps = []
+            for wi, win in enumerate(windows):
+                indices = win["frame_indices"]
+                if not indices:
+                    continue
+                scored = []
+                for fidx in indices:
+                    if top_k_set and fidx not in top_k_set:
+                        continue
+                    s = 0.0
+                    for key, val in penalties_to_apply.items():
+                        if str(fidx) in str(key):
+                            s += float(val)
+                    hist_pen = self._history_penalty_for(fidx, history, float(history_penalty))
+                    s += hist_pen
+                    if fidx in reranker_scores and blend_w > 0:
+                        rr_score = reranker_scores[fidx]
+                        s = (1.0 - blend_w) * s + blend_w * (100.0 - rr_score)
+                    for prev_idx in all_sel:
+                        dist = abs(fidx - prev_idx)
+                        if dist < n_per_window:
+                            s += float(history_penalty) * (1.0 - dist / max(n_per_window, 1))
+                    scored.append((fidx, s))
+                scored.sort(key=lambda x: x[1])
+                w_n = min(n_per_window, len(scored))
+                w_sel = [fidx for fidx, _ in scored[:w_n]]
+                all_sel.extend(w_sel)
+                wr = {
+                    "drop_index": wi,
+                    "beat_time": win.get("time_seconds"),
+                    "frame_index": win.get("frame_index"),
+                    "is_drop": win.get("is_drop", False),
+                    "range_start": win.get("range_start"),
+                    "range_end": win.get("range_end"),
+                    "batch_start": win["batch_start"],
+                    "batch_end": win["batch_end"],
+                    "window_frames": len(indices),
+                    "num_outfits": num_outfits,
+                    "extra_instructions": str(extra_instructions or "").strip(),
+                    "selected_count": len(w_sel),
+                    "selected": w_sel,
+                    "scores": [{"frame": fidx, "penalty": round(s, 2)}
+                               for fidx, s in scored[:max(w_n, min(10, len(scored)))]],
+                }
+                # LLM judging (optional)
+                if use_llm and endpoint and model:
                     try:
-                        parsed = json.loads(re.sub(r'```.*', '', raw).strip())
-                        llm_ids = parsed.get("selected_ids", [])
-                        if llm_ids:
-                            # Convert 1-based LLM IDs to 0-based frame indices
-                            llm_selected = [indices[i - 1] for i in llm_ids
-                                            if 1 <= i <= len(indices)]
-                            if llm_selected:
-                                # Use LLM selection instead
-                                wr["selected"] = llm_selected
-                                wr["selected_count"] = len(llm_selected)
-                                wr["llm_confidence"] = parsed.get("confidence")
-                                wr["llm_reason"] = parsed.get("reason", "")
-                    except Exception:
-                        wr["llm_raw"] = raw[:200]
-                except Exception as e:
-                    wr["llm_error"] = str(e)[:200]
+                        win_frames = images[win["batch_start"]:win["batch_end"]]
+                        win_pils = _image_batch_to_pil_images(win_frames)
+                        labels = [str(i + 1) for i in range(len(win_pils))]
+                        cs_sheet = _build_contact_sheet(win_pils, grid_columns, labels if add_id_labels else None)
+                        raw = self._llm_judge_window(
+                            endpoint, llm_headers, model, system_prompt,
+                            cs_sheet, {**wr, "max_frames": w_n},
+                            max_tokens, temperature, timeout,
+                        )
+                        raw_resps.append(raw)
+                        try:
+                            parsed = json.loads(re.sub(r'```.*', '', raw).strip())
+                            llm_ids = parsed.get("selected_ids", [])
+                            if llm_ids:
+                                llm_sel = [indices[i - 1] for i in llm_ids if 1 <= i <= len(indices)]
+                                if llm_sel:
+                                    wr["selected"] = llm_sel
+                                    wr["selected_count"] = len(llm_sel)
+                                    wr["llm_confidence"] = parsed.get("confidence")
+                                    wr["llm_reason"] = parsed.get("reason", "")
+                        except Exception:
+                            wr["llm_raw"] = raw[:200]
+                    except Exception as e:
+                        wr["llm_error"] = str(e)[:200]
+                win_results.append(wr)
+            return all_sel, win_results, raw_resps
 
-            window_results.append(wr)
+        # ── Run selection ──
+        if has_judge_corrections:
+            # Pass 1: without corrections (just for comparison/delta)
+            baseline_sel, baseline_results, _ = _run_selection({})
+            # Pass 2: with judge corrections — this is the result we return
+            all_selected, window_results, raw_responses = _run_selection(extra_penalties)
+            correction_info = {
+                "judge_corrections_applied": True,
+                "correction_count": len(extra_penalties),
+                "baseline_selection": baseline_sel,
+                "corrected_selection": all_selected,
+                "changed_frames": [f for f in all_selected if f not in baseline_sel],
+            }
+        else:
+            all_selected, window_results, raw_responses = _run_selection(extra_penalties)
+            correction_info = {"judge_corrections_applied": False}
 
         # Record history for selected frames
         for fidx in all_selected:
@@ -529,6 +551,7 @@ class BeatDropSelectorNode:
             "reranker_used": bool(reranker_scores),
             "reranker_blend_weight": round(blend_w, 2),
             "reranker_frames_scored": len(reranker_scores),
+            "correction": correction_info,
             "window_results": window_results,
         }, indent=2)
 
