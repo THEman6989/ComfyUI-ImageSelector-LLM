@@ -63,7 +63,7 @@ CRITICAL: The OLD OUTFIT reference image shows a DIFFERENT PERSON than the one i
 For EACH candidate outfit, evaluate these dimensions (0.0-1.0):
 
 1. scene_fit_score: How well does this CLOTHING fit the scene lighting, pose, camera angle, and video vibe? The person wearing it in the reference is NOT the video person — judge only the clothes.
-2. change_strength_score: How DIFFERENT is this outfit from the old outfit? Consider color, silhouette, material, and overall impression. A good beatdrop needs a VISIBLE change in clothing. IGNORE the models — compare only what they're wearing.
+2. change_strength_score: How DIFFERENT is this outfit from the old outfit? Consider the overall VIBE — silhouette, cut, shape, style, material. A good beatdrop needs an immediately noticeable change. The eye should see a completely different look. IGNORE the models — compare only what they're wearing.
 3. beatdrop_impact_score: Would seeing this outfit change at a beatdrop moment create a strong, noticeable impact?
 4. render_safety_score: Is the outfit visually clear, not too chaotic in detail, and likely to render stably with image-to-video models?
 5. too_similar_to_old_outfit: true/false — is this CANDIDATE OUTFIT's clothing too similar to the old outfit's clothing to create a meaningful beatdrop?

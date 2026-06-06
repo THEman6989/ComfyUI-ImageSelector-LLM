@@ -394,8 +394,10 @@ class BeatDropSelectorNode:
             if api_token:
                 reranker_headers["Authorization"] = f"Bearer {api_token}"
             query = str(reranker_query or "").strip() or (
-                "Outfits with strong visual difference from the old outfit, "
-                "clear silhouette, distinct color, suitable for a visible beatdrop change."
+                "Outfits that are VISIBLY DIFFERENT from each other in overall vibe — "
+                "different silhouette, different cut and shape, different style. "
+                "The change should be immediately noticeable: the eye should see "
+                "a completely different look when the beat drops."
             )
             documents = [f"Frame {i}: beatdrop candidate image" for i in range(B)]
             rr = self._run_reranker(
