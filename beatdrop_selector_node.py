@@ -9,8 +9,10 @@ Place this in ComfyUI-ImageSelector-LLM alongside openai_llm_node.py.
 import json
 import re
 import torch
+import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
+from PIL import Image
 
 # Reuse helpers from the parent module (relative import) or standalone
 try:
@@ -135,6 +137,12 @@ class BeatDropSelectorNode:
                 "extra_instructions": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "Zusaetzliche Anweisungen, z.B. 'Outfits muessen verschiedene Farben haben, mind. 2 komplett verschiedene Styles'",
                     "tooltip": "Supplementary instructions injected into selection prompt"}),
+                # Folder-based candidate loading (alternative to direct IMAGE input)
+                "candidate_folders": ("STRING", {"default": "", "multiline": False,
+                    "placeholder": "/path/to/outfits/ — root folder with subdirectories (jackets/, no-jacket/, exotic/, chill/)",
+                    "tooltip": "Root folder with outfit subdirectories. Vision LLM selects which folders to use."}),
+                "max_candidate_images": ("INT", {"default": 30, "min": 5, "max": 500, "step": 5,
+                    "tooltip": "Max images to load from selected folders. Pre-filtered by history + random sample."}),
             },
         }
 
@@ -310,6 +318,214 @@ class BeatDropSelectorNode:
         resp.raise_for_status()
         return _extract_choice_content(resp.json())
 
+    # ── Folder-based candidate loading ────────────────────────────────
+
+    def _scan_folders(self, root_path):
+        """Scan subdirectories, return [(folder_name, [image_paths]), ...]."""
+        import os as _os
+        root = Path(root_path).expanduser()
+        if not root.is_dir():
+            return []
+        folders = []
+        for entry in sorted(root.iterdir()):
+            if entry.is_dir():
+                imgs = sorted([
+                    str(p) for p in entry.iterdir()
+                    if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+                ])
+                if imgs:
+                    folders.append((entry.name, imgs))
+        return folders
+
+    def _select_folders_via_llm(self, folders, endpoint, headers, model,
+                                 extra_instructions, timeout):
+        """Send sample images from each folder to Vision LLM.
+        Returns list of folder names to use, in order."""
+        import requests, random
+
+        if not folders or not endpoint or not model:
+            return [name for name, _ in folders]  # use all
+
+        # Build samples: up to 3 images per folder
+        content = [{
+            "type": "text",
+            "text": (
+                "You are selecting outfit categories for a beatdrop video effect.\n\n"
+                "Below are sample images from different outfit folders.\n"
+                "Decide which folder(s) to use and in what ORDER.\n\n"
+                "Consider: the outfits should create a VISIBLE CHANGE at the beatdrop.\n"
+                "For example: first a jacket outfit, then without jacket = strong change.\n\n"
+            ),
+        }]
+        if extra_instructions:
+            content.append({
+                "type": "text",
+                "text": f"SPECIAL INSTRUCTIONS:\n{extra_instructions}\n",
+            })
+
+        folder_labels = []
+        for folder_name, img_paths in folders:
+            samples = random.sample(img_paths, min(3, len(img_paths)))
+            for sp in samples:
+                try:
+                    pil_img = Image.open(sp).convert("RGB")
+                    data_url = _encode_pil_to_data_url(pil_img)
+                    content.append({
+                        "type": "text",
+                        "text": f"From folder '{folder_name}':",
+                    })
+                    content.append(_image_url_part(data_url))
+                except Exception:
+                    pass
+            folder_labels.append(folder_name)
+
+        content.append({
+            "type": "text",
+            "text": (
+                f"Available folders: {json.dumps(folder_labels)}\n\n"
+                "Return ONLY valid JSON:\n"
+                '{"selected_folders": ["folder_name"], "reason": "..."}\n'
+                "List folders in the order they should be used (first at beatdrop, second after, etc.)"
+            ),
+        })
+
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "You are a fashion curator for video beatdrop effects. Select outfit categories that create strong visual contrast."},
+                {"role": "user", "content": content},
+            ],
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "stream": False,
+        }
+        try:
+            resp = requests.post(endpoint, headers=headers, json=payload,
+                                timeout=min(max(int(timeout), 1), 60))
+            resp.raise_for_status()
+            body = resp.json()
+            choices = body.get("choices", [])
+            text = choices[0].get("message", {}).get("content", "") if choices else ""
+            parsed = json.loads(re.sub(r"```.*", "", text).strip())
+            selected = parsed.get("selected_folders", [])
+            if isinstance(selected, list) and selected:
+                # Validate against actual folder names
+                valid = [s for s in selected if s in folder_labels]
+                return valid if valid else [name for name, _ in folders]
+        except Exception:
+            pass
+        return [name for name, _ in folders]
+
+    def _load_filtered_candidates(self, folders, selected_names, max_images,
+                                    history, history_penalty, decay_rate):
+        """Load images from selected folders, filter by history, random sample."""
+        import random, numpy as np
+
+        # Collect all image paths from selected folders
+        all_paths = []
+        for name, paths in folders:
+            if name in selected_names:
+                all_paths.extend([(name, p) for p in paths])
+
+        if not all_paths:
+            return None, []
+
+        # Apply history filter: compute penalty for each image, exclude heavily penalized
+        scored_paths = []
+        for folder_name, path in all_paths:
+            # Use file path hash as frame key for history
+            frame_key = f"folder_{folder_name}_{Path(path).stem}"
+            hist_pen = 0.0
+            # Check if this image was recently selected
+            for entry in reversed(history.get("selections", [])[-50:]):
+                if entry.get("key") == frame_key:
+                    hist_pen = self._history_penalty_for(
+                        hash(frame_key) % 10000, history, float(history_penalty), float(decay_rate),
+                    )
+                    break
+            scored_paths.append((folder_name, path, hist_pen))
+
+        # Sort by penalty (low = less penalized = preferred)
+        scored_paths.sort(key=lambda x: x[2])
+
+        # Take up to max_images, but randomize within acceptable range
+        max_img = min(int(max_images), len(scored_paths))
+        # Take top 2/3 by score, then random from those
+        pool_size = min(len(scored_paths), max(int(max_img * 1.5), max_img))
+        pool = scored_paths[:pool_size]
+        selected = random.sample(pool, min(max_img, len(pool)))
+
+        # Load images into tensor
+        loaded = []
+        folder_map = {}
+        for idx, (fname, path, penalty) in enumerate(selected):
+            try:
+                pil_img = Image.open(path).convert("RGB")
+                arr = np.array(pil_img, dtype=np.float32) / 255.0
+                tensor = torch.from_numpy(arr)  # (H, W, 3)
+                loaded.append(tensor)
+                folder_map[idx] = fname
+            except Exception:
+                continue
+
+        if not loaded:
+            return None, []
+
+        # Stack to uniform size (resize all to match first image)
+        h, w = loaded[0].shape[:2]
+        uniform = []
+        for t in loaded:
+            if t.shape[0] != h or t.shape[1] != w:
+                t = F.interpolate(
+                    t.permute(2, 0, 1).unsqueeze(0),
+                    size=(h, w), mode="bilinear", align_corners=False,
+                ).squeeze(0).permute(1, 2, 0)
+            uniform.append(t)
+
+        images_tensor = torch.stack(uniform, dim=0)  # (N, H, W, 3)
+        folder_list = [folder_map.get(i, "unknown") for i in range(len(selected))]
+        return images_tensor, folder_list
+
+    def _load_from_folders(self, root_path, endpoint, api_token, model,
+                           history_file, history_penalty, decay_rate,
+                           extra_instructions, timeout, max_images):
+        """Full folder-based loading pipeline: scan → LLM-select → pre-filter → load."""
+        import requests
+        folders = self._scan_folders(root_path)
+        if not folders:
+            return None, {"error": "no subdirectories with images found"}
+
+        # LLM folder selection
+        headers = {"Content-Type": "application/json"}
+        if api_token:
+            headers["Authorization"] = f"Bearer {api_token}"
+
+        history = self._load_history(history_file)
+        selected_folders = []
+
+        if endpoint and model:
+            selected_folders = self._select_folders_via_llm(
+                folders, endpoint, headers, model, extra_instructions, timeout,
+            )
+        if not selected_folders:
+            selected_folders = [name for name, _ in folders]
+
+        # Load + pre-filter
+        images, folder_list = self._load_filtered_candidates(
+            folders, selected_folders, max_images,
+            history, history_penalty, decay_rate,
+        )
+
+        info = {
+            "source": "folders",
+            "root": root_path,
+            "folders_found": [name for name, _ in folders],
+            "folders_selected": selected_folders,
+            "images_loaded": images.shape[0] if images is not None else 0,
+            "max_candidate_images": int(max_images),
+        }
+        return images, info
+
     # ── Main selection logic ───────────────────────────────────────────
 
     def select(self, max_frames_per_window, num_outfits_mode, num_outfits,
@@ -322,10 +538,26 @@ class BeatDropSelectorNode:
                history_decay_rate=0.3,
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
                reranker_top_k=12, reranker_query="",
-               extra_instructions=""):
+               extra_instructions="",
+               candidate_folders="", max_candidate_images=30):
+
+        folder_info = None  # populated when loading from folders
 
         if images is None or not isinstance(images, torch.Tensor):
-            return ("", 0, '{"error":"no images provided"}', _make_blank_image(), "")
+            # Try folder-based loading as fallback
+            folder_path = str(candidate_folders or "").strip()
+            if folder_path:
+                images, folder_info = self._load_from_folders(
+                    folder_path, endpoint, api_token, model,
+                    history_file, history_penalty, history_decay_rate,
+                    extra_instructions, timeout, max_candidate_images,
+                )
+                if images is None:
+                    return ("", 0, json.dumps({"error": "no images in folders", "folders_scanned": folder_path}),
+                            _make_blank_image(), "")
+            else:
+                return ("", 0, json.dumps({"error": "no images provided and no candidate_folders set"}),
+                        _make_blank_image(), "")
 
         B = images.shape[0]
         n_per_window = max(1, min(int(max_frames_per_window), B))
@@ -563,6 +795,7 @@ class BeatDropSelectorNode:
             "reranker_blend_weight": round(blend_w, 2),
             "reranker_frames_scored": len(reranker_scores),
             "correction": correction_info,
+            "folder_loading": folder_info,
             "window_results": window_results,
         }, indent=2)
 
