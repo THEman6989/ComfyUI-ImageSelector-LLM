@@ -1214,11 +1214,38 @@ class BeatDropSelectorEmbeddingNode:
             # ── VLM Fallback for this window (if needed) ──
             if needs_vlm:
                 try:
-                    win_frames = reference_frames[win["batch_start"]:win["batch_end"]]
-                    win_pils = _image_batch_to_pil_images(win_frames)
-                    labels = [str(i + 1) for i in range(len(win_pils))]
+                    # Build Top-K candidate list from scored frames (NOT all window frames!)
+                    # The LLM should only see the best candidates, with scores as context
+                    top_k_for_vlm = min(len(scored), max(w_n * 3, 12))  # show top 12-20
+                    vlm_candidates = scored[:top_k_for_vlm]
+
+                    # Collect frames + scores for the LLM
+                    vlm_frame_indices = []  # absolute frame indices
+                    score_lines = []
+                    for rank, (fidx, score) in enumerate(vlm_candidates):
+                        vlm_frame_indices.append(fidx)
+                        parts = [f"  Frame {rank + 1} (global idx {fidx}): penalty={score:.1f}"]
+                        if fidx in reranker_scores:
+                            parts.append(f"reranker={reranker_scores[fidx]:.1f}")
+                        if embedding_scores and fidx in embedding_scores:
+                            es = embedding_scores[fidx]
+                            parts.append(f"scene_fit={es['scene_fit']:.3f}")
+                            parts.append(f"change={es['change_strength']:.3f}")
+                        score_lines.append(", ".join(parts))
+
+                    # Build contact sheet from ONLY the top-K frames
+                    vlm_frames = reference_frames[torch.tensor(vlm_frame_indices, dtype=torch.long)]
+                    vlm_pils = _image_batch_to_pil_images(vlm_frames)
+                    labels = [str(i + 1) for i in range(len(vlm_pils))]
                     cs_sheet = _build_contact_sheet(
-                        win_pils, grid_columns, labels if add_id_labels else None,
+                        vlm_pils, grid_columns, labels if add_id_labels else None,
+                    )
+
+                    # Enrich the prompt with scores as guidance
+                    score_context = (
+                        f"Top candidates (Re-Ranker + History scored):\n" +
+                        "\n".join(score_lines) +
+                        "\n\nUse these scores as guidance but make your own visual judgment."
                     )
 
                     vlm_headers = {"Content-Type": "application/json"}
@@ -1229,10 +1256,11 @@ class BeatDropSelectorEmbeddingNode:
                         vlm_endpoint, vlm_headers, vlm_model, vlm_system_prompt,
                         cs_sheet,
                         {
-                            "window_frames": len(win_pils),
+                            "window_frames": len(vlm_pils),
                             "max_frames": w_n,
                             "num_outfits": num_outfits,
                             "extra_instructions": extra_instructions,
+                            "_score_context": score_context,  # injected into prompt
                         },
                         vlm_max_tokens, vlm_temperature, vlm_timeout,
                     )
@@ -1244,7 +1272,9 @@ class BeatDropSelectorEmbeddingNode:
                         parsed = json.loads(re.sub(r'```.*', '', raw).strip())
                         llm_ids = parsed.get("selected_ids", [])
                         if llm_ids:
-                            llm_sel = [indices[i - 1] for i in llm_ids if 1 <= i <= len(indices)]
+                            # Map 1-based contact-sheet indices → absolute frame indices
+                            llm_sel = [vlm_frame_indices[i - 1] for i in llm_ids
+                                       if 1 <= i <= len(vlm_frame_indices)]
                             if llm_sel:
                                 w_sel = llm_sel
                     except Exception:

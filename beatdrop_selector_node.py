@@ -146,6 +146,10 @@ class BeatDropSelectorNode:
                     "tooltip": "What the reranker should look for in candidates"}),
                 "reranker_blend_weight": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.05,
                     "tooltip": "How much to blend reranker scores (0=ignore, 1=full reranker)"}),
+                "reranker_stage2": ("BOOLEAN", {"default": False,
+                    "tooltip": "Stage-2: Run reranker again on selected candidates as confidence check. High gap = skip LLM."}),
+                "reranker_stage2_threshold": ("FLOAT", {"default": 0.2, "min": 0.05, "max": 1.0, "step": 0.05,
+                    "tooltip": "Gap between top score and next. Above = high confidence, skip LLM."}),
                 "extra_instructions": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "Zusaetzliche Anweisungen, z.B. 'Outfits muessen verschiedene Farben haben, mind. 2 komplett verschiedene Styles'",
                     "tooltip": "Supplementary instructions injected into selection prompt"}),
@@ -759,6 +763,7 @@ class BeatDropSelectorNode:
                history_decay_rate=0.3,
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
                reranker_top_k=12, reranker_query="",
+               reranker_stage2=False, reranker_stage2_threshold=0.2,
                extra_instructions="",
                conversation_id="",
                candidate_folders="", max_candidate_images=30,
@@ -1047,6 +1052,56 @@ class BeatDropSelectorNode:
             all_selected, window_results, raw_responses = _run_selection(extra_penalties)
             correction_info = {"judge_corrections_applied": False}
 
+        # ── Stage-2: Re-Ranker Confidence Check ──
+        stage2_info = {}  # type: dict
+        stage2_info["enabled"] = False
+        if reranker_stage2 and reranker_endpoint and reranker_endpoint.strip() and all_selected:
+            stage2_info["enabled"] = True
+            try:
+                # Build Stage-2 query: specific, focused on visible change
+                s2_query = (
+                    "Outfit that creates MAXIMUM visible beatdrop change: "
+                    "most different silhouette, cut, shape, style from the others. "
+                    "The change must be immediately noticeable."
+                )
+                # Documents are the selected frames
+                s2_docs = [f"Selected frame {fidx}" for fidx in all_selected]
+                s2_headers = {"Content-Type": "application/json"}
+                if api_token:
+                    s2_headers["Authorization"] = f"Bearer {api_token}"
+                s2_scores = self._run_reranker(
+                    reranker_endpoint, s2_headers, reranker_model,
+                    s2_query, s2_docs, top_n=len(s2_docs), timeout=timeout,
+                )
+                if s2_scores and len(s2_scores) >= 2:
+                    s2_vals = [s for _, s in s2_scores]
+                    top_score = s2_vals[0]
+                    next_score = s2_vals[1] if len(s2_vals) > 1 else 0.0
+                    gap = top_score - next_score  # RAW gap, not normalized
+                    threshold = max(0.02, float(reranker_stage2_threshold))
+
+                    # Normalize for display only
+                    s2_min, s2_max = min(s2_vals), max(s2_vals)
+                    s2_range = s2_max - s2_min if s2_max > s2_min else 1.0
+                    s2_norm = [(idx, (s - s2_min) / s2_range) for idx, s in s2_scores]
+
+                    stage2_info.update({
+                        "top_score": round(top_score, 4),
+                        "next_score": round(next_score, 4),
+                        "gap": round(gap, 4),
+                        "threshold": round(threshold, 2),
+                        "high_confidence": gap >= threshold,
+                        "recommendation": (
+                            "HIGH confidence — skip Vision-LLM, use selection directly"
+                            if gap >= threshold else
+                            "LOW confidence — consider Vision-LLM for final decision"
+                        ),
+                        "scores": [{"frame": int(idx), "score": round(s, 4)}
+                                  for idx, s in s2_scores[:10]],
+                    })
+            except Exception as e:
+                stage2_info["error"] = str(e)[:200]
+
         # Record history for selected frames (frame indices + folder images)
         for fidx in all_selected:
             history.setdefault("selections", []).append({
@@ -1099,6 +1154,7 @@ class BeatDropSelectorNode:
             "reranker_blend_weight": round(blend_w, 2),
             "reranker_frames_scored": len(reranker_scores),
             "correction": correction_info,
+            "reranker_stage2": stage2_info,
             "folder_loading": folder_info,
             "window_results": window_results,
         }, indent=2)
