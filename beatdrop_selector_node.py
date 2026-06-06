@@ -352,25 +352,54 @@ class BeatDropSelectorNode:
         return folders
 
     def _select_folders_via_llm(self, folders, endpoint, headers, model,
-                                 extra_instructions, timeout):
-        """Send sample images from each folder to Vision LLM.
-        Returns list of folder names to use, in order."""
+                                 extra_instructions, timeout,
+                                 scene_frames=None):
+        """Send sample images from each folder + scene context to Vision LLM.
+        Returns list of folder names to use, in order.
+        scene_frames: video frames as context (what the scene looks like)"""
         import requests, random
 
         if not folders or not endpoint or not model:
             return [name for name, _ in folders]  # use all
 
-        # Build samples: up to 3 images per folder
+        # Build: show scene context first
         content = [{
             "type": "text",
             "text": (
                 "You are selecting outfit categories for a beatdrop video effect.\n\n"
-                "Below are sample images from different outfit folders.\n"
-                "Decide which folder(s) to use and in what ORDER.\n\n"
-                "Consider: the outfits should create a VISIBLE CHANGE at the beatdrop.\n"
-                "For example: first a jacket outfit, then without jacket = strong change.\n\n"
             ),
         }]
+
+        # ── Scene context (video frames) ──
+        if scene_frames is not None and isinstance(scene_frames, torch.Tensor) and scene_frames.shape[0] > 0:
+            content.append({
+                "type": "text",
+                "text": "SCENE CONTEXT: This is what the video scene looks like. Choose outfits that fit this scene.",
+            })
+            # Downsample scene to max 4 frames for the LLM
+            sf = scene_frames
+            if sf.shape[0] > 4:
+                keep = torch.linspace(0, sf.shape[0] - 1, 4).long()
+                sf = sf[keep]
+            for i in range(sf.shape[0]):
+                try:
+                    arr = (sf[i].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+                    pil_img = Image.fromarray(arr)
+                    data_url = _encode_pil_to_data_url(pil_img)
+                    content.append(_image_url_part(data_url))
+                except Exception:
+                    pass
+
+        # ── Folder samples ──
+        content.append({
+            "type": "text",
+            "text": (
+                "Below are sample images from different outfit folders.\n"
+                "Decide which folder(s) to use and in what ORDER.\n\n"
+                "Consider: the outfits should create a VISIBLE CHANGE at the beatdrop AND fit the scene above.\n"
+                "For example: first a jacket outfit, then without jacket = strong change.\n\n"
+            ),
+        })
         if extra_instructions:
             content.append({
                 "type": "text",
@@ -511,7 +540,7 @@ class BeatDropSelectorNode:
     def _load_from_folders(self, root_path, endpoint, api_token, model,
                            history_file, history_penalty, decay_rate,
                            extra_instructions, timeout, max_images,
-                           use_random):
+                           use_random, scene_frames=None):
         """Full folder-based loading pipeline: scan → LLM-select → pre-filter → load."""
         import requests
         folders = self._scan_folders(root_path)
@@ -528,6 +557,7 @@ class BeatDropSelectorNode:
         if endpoint and model:
             selected_folders = self._select_folders_via_llm(
                 folders, endpoint, headers, model, extra_instructions, timeout,
+                scene_frames=scene_frames,
             )
         if not selected_folders:
             selected_folders = [name for name, _ in folders]
@@ -646,6 +676,7 @@ class BeatDropSelectorNode:
                     history_file, history_penalty, history_decay_rate,
                     extra_instructions, timeout, max_candidate_images,
                     use_random_sample,
+                    scene_frames=reference_frames,
                 )
                 if images is None:
                     return ("", 0, json.dumps({"error": "no images in folders", "folders_scanned": folder_path}),

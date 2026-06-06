@@ -202,11 +202,11 @@ class AlphaRavisOutfitReferenceJudgeNode:
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "STRING", "STRING", "FLOAT", "FLOAT", "FLOAT",
-                    "BOOLEAN", "STRING")
+                    "BOOLEAN", "STRING", "STRING")
     RETURN_NAMES = ("selected_image", "selected_index", "selected_outfit_id",
                     "judge_json", "confidence", "change_strength_score",
                     "beatdrop_impact_score", "too_similar_to_old_outfit",
-                    "raw_response")
+                    "raw_response", "extra_penalty_json")
     FUNCTION = "judge"
     CATEGORY = "Amin/Beatdrop"
 
@@ -365,13 +365,13 @@ class AlphaRavisOutfitReferenceJudgeNode:
         if candidate_images is None or not isinstance(candidate_images, torch.Tensor):
             blank = _make_blank_image()
             return (blank, -1, "", '{"error":"no candidate images"}',
-                    0.0, 0.0, 0.0, True, "")
+                    0.0, 0.0, 0.0, True, "", "{}")
 
         N = candidate_images.shape[0]
         if N == 0:
             blank = _make_blank_image()
             return (blank, -1, "", '{"error":"empty candidate images"}',
-                    0.0, 0.0, 0.0, True, "")
+                    0.0, 0.0, 0.0, True, "", "{}")
 
         # ── Downsample if exceeding max_candidate_frames ──
         max_cand = max(5, int(max_candidate_frames))
@@ -401,7 +401,7 @@ class AlphaRavisOutfitReferenceJudgeNode:
         if not endpoint:
             blank = _make_blank_image()
             return (blank, -1, "", '{"error":"no endpoint configured"}',
-                    0.0, 0.0, 0.0, True, "")
+                    0.0, 0.0, 0.0, True, "", "{}")
 
         # ── Build headers with AlphaRavis metadata ──
         headers = {"Content-Type": "application/json"}
@@ -593,6 +593,7 @@ class AlphaRavisOutfitReferenceJudgeNode:
                 validate_result["drop_id"] = drop_id
 
             judge_json = json.dumps(validate_result, indent=2)
+            extra_pen_str = json.dumps(extra_penalties)
             return (
                 _make_blank_image(),
                 -1,
@@ -602,6 +603,7 @@ class AlphaRavisOutfitReferenceJudgeNode:
                 0.0, 0.0,
                 not passed,  # too_similar = !passed
                 json.dumps({"responses": all_responses, "candidates_scored": len(all_candidate_scores)}, indent=2),
+                extra_pen_str,
             )
 
         # ── select_and_judge mode: pick best outfit ──
@@ -641,4 +643,5 @@ class AlphaRavisOutfitReferenceJudgeNode:
             best_result.get("beatdrop_impact_score", 0.0),
             best_result.get("too_similar_to_old_outfit", True),
             json.dumps({"responses": all_responses, "candidates_scored": len(all_candidate_scores)}, indent=2),
+            "{}",  # extra_penalty_json: empty in select_and_judge mode
         )
