@@ -132,9 +132,11 @@ class AlphaRavisOutfitReferenceJudgeNode:
             "optional": {
                 # Images
                 "candidate_images": ("IMAGE", {"tooltip": "Top-K candidates from Re-Ranker"}),
+                "reference_frames": ("IMAGE", {"tooltip": "Video frames from FrameSequenceGenerator — scene context (inside drop windows)"}),
+                "context_frames": ("IMAGE", {"tooltip": "Video frames OUTSIDE drop windows — broader scene context"}),
                 "old_outfit_crop": ("IMAGE", {"tooltip": "Current/old outfit for comparison"}),
                 "scene_reference_image": ("IMAGE", {"tooltip": "Scene context frame"}),
-                "reference_video_frames": ("IMAGE", {"tooltip": "Additional video frames for context"}),
+                "reference_video_frames": ("IMAGE", {"tooltip": "Additional video frames for context (deprecated, use reference_frames+context_frames)"}),
                 # Context JSON
                 "reranker_scores_json": ("STRING", {
                     "default": "{}", "multiline": True,
@@ -341,7 +343,9 @@ class AlphaRavisOutfitReferenceJudgeNode:
     # ── Main judge ────────────────────────────────────────────────────
 
     def judge(self, endpoint, model, max_images_per_call, temperature, timeout,
-              candidate_images=None, old_outfit_crop=None,
+              candidate_images=None,
+              reference_frames=None, context_frames=None,
+              old_outfit_crop=None,
               scene_reference_image=None, reference_video_frames=None,
               reranker_scores_json="{}", drop_context_json="{}",
               embedding_change_json="{}", mask_quality_json="{}",
@@ -426,6 +430,27 @@ class AlphaRavisOutfitReferenceJudgeNode:
                 )
                 reference_parts.append({"type": "text", "text": "ADDITIONAL CONTEXT: Nearby video frames:"})
                 reference_parts.append(_image_url_part(_encode_pil_to_data_url(ref_sheet)))
+
+        # ── Merge reference_frames + context_frames for full scene context ──
+        all_scene_frames = []
+        if reference_frames is not None and isinstance(reference_frames, torch.Tensor):
+            all_scene_frames.append(reference_frames)
+        if context_frames is not None and isinstance(context_frames, torch.Tensor):
+            all_scene_frames.append(context_frames)
+        if all_scene_frames:
+            merged = torch.cat(all_scene_frames, dim=0)
+            # Downsample if too many
+            max_ctx = 16  # max scene context frames for LLM
+            if merged.shape[0] > max_ctx:
+                keep = torch.linspace(0, merged.shape[0] - 1, max_ctx).long()
+                merged = merged[keep]
+            scene_pils = _tensor_to_pil(merged)
+            scene_sheet = _build_contact_sheet(
+                scene_pils, columns=min(grid_columns, len(scene_pils)),
+                labels=[str(i) for i in range(len(scene_pils))],
+            )
+            reference_parts.append({"type": "text", "text": "SCENE CONTEXT: Video frames (inside + outside drop windows):"})
+            reference_parts.append(_image_url_part(_encode_pil_to_data_url(scene_sheet)))
 
         # ── Build context text ──
         context_parts = []
