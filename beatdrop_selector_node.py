@@ -269,14 +269,34 @@ class BeatDropSelectorNode:
         return sorted(scores, key=lambda x: x[1], reverse=True)
 
     def _run_reranker(self, endpoint, headers, model, query, documents, top_n, timeout):
-        """Call reranker API, return sorted (index, score) list or None."""
+        """Call reranker API with auto-detection. Returns sorted (index, score) list or None."""
         import requests
+
+        # Auto-detect: probe the endpoint
+        resolved_model = str(model or "").strip()
         urls = self._reranker_urls(endpoint)
         if not urls:
             return None
-        payload = self._reranker_payload(query, documents, model, top_n)
+
+        # Try model auto-detection if not set
+        if not resolved_model:
+            for url in urls:
+                try:
+                    base = url.rsplit("/", 1)[0] if "/rerank" in url else url
+                    r = requests.get(base + "/v1/models", headers=headers,
+                                    timeout=min(max(int(timeout), 1), 10))
+                    if r.ok:
+                        models = r.json().get("data", [])
+                        if models:
+                            resolved_model = str(models[0].get("id", "")).strip()
+                            break
+                except Exception:
+                    continue
+
+        # Try each URL pattern (vLLM, SGLang, llama.cpp all use /rerank or /v1/rerank)
         for url in urls:
             try:
+                payload = self._reranker_payload(query, documents, resolved_model, top_n)
                 r = requests.post(url, headers=headers, json=payload,
                                   timeout=min(max(int(timeout), 1), 30))
                 r.raise_for_status()
