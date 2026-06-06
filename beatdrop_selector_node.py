@@ -149,6 +149,8 @@ class BeatDropSelectorNode:
                 "extra_instructions": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "Zusaetzliche Anweisungen, z.B. 'Outfits muessen verschiedene Farben haben, mind. 2 komplett verschiedene Styles'",
                     "tooltip": "Supplementary instructions injected into selection prompt"}),
+                "conversation_id": ("STRING", {"default": "", "multiline": False,
+                    "tooltip": "AlphaRavis thread ID — shared with Judge so folder-LLM and Judge are same context"}),
                 # Folder-based candidate loading (alternative to direct IMAGE input)
                 "candidate_folders": ("STRING", {"default": "", "multiline": False,
                     "placeholder": "/path/to/outfits/ — root folder with subdirectories (jackets/, no-jacket/, exotic/, chill/)",
@@ -540,7 +542,8 @@ class BeatDropSelectorNode:
     def _load_from_folders(self, root_path, endpoint, api_token, model,
                            history_file, history_penalty, decay_rate,
                            extra_instructions, timeout, max_images,
-                           use_random, scene_frames=None):
+                           use_random, scene_frames=None,
+                           conversation_id=""):
         """Full folder-based loading pipeline: scan → LLM-select → pre-filter → load."""
         import requests
         folders = self._scan_folders(root_path)
@@ -550,6 +553,9 @@ class BeatDropSelectorNode:
         headers = {"Content-Type": "application/json"}
         if api_token:
             headers["Authorization"] = f"Bearer {api_token}"
+        if conversation_id:
+            headers["x-conversation-id"] = str(conversation_id)
+            headers["x-thread-id"] = str(conversation_id)
 
         history = self._load_history(history_file)
         selected_folders = []
@@ -662,6 +668,7 @@ class BeatDropSelectorNode:
                reranker_endpoint="", reranker_model="", reranker_blend_weight=0.3,
                reranker_top_k=12, reranker_query="",
                extra_instructions="",
+               conversation_id="",
                candidate_folders="", max_candidate_images=30,
                use_random_sample=True):
 
@@ -677,6 +684,7 @@ class BeatDropSelectorNode:
                     extra_instructions, timeout, max_candidate_images,
                     use_random_sample,
                     scene_frames=reference_frames,
+                    conversation_id=conversation_id,
                 )
                 if images is None:
                     return ("", 0, json.dumps({"error": "no images in folders", "folders_scanned": folder_path}),
