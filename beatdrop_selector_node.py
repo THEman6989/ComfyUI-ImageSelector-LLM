@@ -94,13 +94,25 @@ class BeatDropSelectorNode:
                     "tooltip": "Manual: minimum number of VISIBLY DIFFERENT outfits. Ignored when mode=auto_from_beats"}),
             },
             "optional": {
-                "images": ("IMAGE",),
+                "reference_frames": ("IMAGE", {"tooltip": "Video frames from FrameSequenceGenerator — context/reference, NOT outfit candidates"}),
+                "context_frames": ("IMAGE", {"tooltip": "Video frames OUTSIDE drop windows (low fps context)"}),
                 "beats_used": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "beats_used JSON from FrameSequenceGenerator"}),
                 "penalty": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.1,
                     "tooltip": "Johnson history penalty shift from Judge feedback"}),
                 "extra_penalty_json": ("STRING", {"default": "{}", "multiline": True,
                     "placeholder": "JSON dict {frame_id: penalty_value} from Judge"}),
+                # Frame management
+                "max_total_frames": ("INT", {"default": 100, "min": 5, "max": 500, "step": 5,
+                    "tooltip": "Max total frames before LLM. Exceeding triggers downsampling."}),
+                "job_fps": ("FLOAT", {"default": 5.0, "min": 0.5, "max": 60.0, "step": 0.5,
+                    "tooltip": "Frames per second INSIDE drop windows"}),
+                "context_fps": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 30.0, "step": 0.1,
+                    "tooltip": "Frames per second OUTSIDE drop windows (lower = sparser context)"}),
+                "downsample_mode": (["global", "per_job"], {"default": "global",
+                    "tooltip": "global: downsample across all frames. per_job: downsample each window separately."}),
+                "image_resolution": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 64,
+                    "tooltip": "Max pixel dimension before sending to LLM/Re-Ranker. Images resized to fit."}),
                 # LLM mode
                 "use_llm": ("BOOLEAN", {"default": False,
                     "tooltip": "Enable LLM-based visual judging per window"}),
@@ -539,11 +551,79 @@ class BeatDropSelectorNode:
         }
         return images, info
 
+    @staticmethod
+    def _resize_frame(tensor, max_dim):
+        """Resize a single frame tensor (H,W,3) so longest side ≤ max_dim."""
+        h, w = tensor.shape[:2]
+        if h <= max_dim and w <= max_dim:
+            return tensor
+        scale = max_dim / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        return F.interpolate(
+            tensor.permute(2, 0, 1).unsqueeze(0),
+            size=(new_h, new_w), mode="bilinear", align_corners=False,
+        ).squeeze(0).permute(1, 2, 0)
+
+    @staticmethod
+    def _downsample_frames(frames, max_total, job_mask, job_fps, context_fps, mode):
+        """Downsample frames proportionally by fps ratio when exceeding max_total.
+
+        job_mask: boolean tensor (B,) — True if frame is in a job window
+        job_fps / context_fps: ratio determines how many frames to cut from each group
+
+        mode='global': cut from entire batch proportionally
+        mode='per_job': cut from each window independently
+        """
+        import torch as _torch
+        B = frames.shape[0]
+        if B <= max_total:
+            return frames, job_mask
+
+        to_remove = B - max_total
+        job_count = int(job_mask.sum().item())
+        ctx_count = B - job_count
+
+        if job_count == 0 or ctx_count == 0:
+            # Only one type — uniform downsampling
+            keep = _torch.linspace(0, B - 1, max_total).long()
+            return frames[keep], job_mask[keep]
+
+        # Weighted removal: keep proportionally more from higher-fps group
+        job_weight = job_fps / max(job_fps, context_fps)
+        ctx_weight = context_fps / max(job_fps, context_fps)
+        total_weight = job_weight * job_count + ctx_weight * ctx_count
+
+        job_keep_target = int(job_count * (1.0 - to_remove * job_weight / total_weight))
+        ctx_keep_target = int(ctx_count * (1.0 - to_remove * ctx_weight / total_weight))
+        job_keep_target = max(1, min(job_keep_target, job_count))
+        ctx_keep_target = max(1, min(ctx_keep_target, ctx_count))
+
+        # Build keep indices
+        job_indices = _torch.where(job_mask)[0]
+        ctx_indices = _torch.where(~job_mask)[0]
+
+        if len(job_indices) > 0:
+            job_keep = _torch.linspace(0, len(job_indices) - 1, job_keep_target).long()
+            job_keep = job_indices[job_keep]
+        else:
+            job_keep = _torch.tensor([], dtype=_torch.long)
+
+        if len(ctx_indices) > 0:
+            ctx_keep = _torch.linspace(0, len(ctx_indices) - 1, ctx_keep_target).long()
+            ctx_keep = ctx_indices[ctx_keep]
+        else:
+            ctx_keep = _torch.tensor([], dtype=_torch.long)
+
+        keep = _torch.cat([job_keep, ctx_keep]).sort().values
+        return frames[keep], job_mask[keep]
+
     # ── Main selection logic ───────────────────────────────────────────
 
     def select(self, max_frames_per_window, num_outfits_mode, num_outfits,
-               images=None, beats_used="",
+               reference_frames=None, context_frames=None, beats_used="",
                penalty=0.0, extra_penalty_json="{}",
+               max_total_frames=100, job_fps=5.0, context_fps=1.0,
+               downsample_mode="global", image_resolution=512,
                use_llm=False, endpoint="", api_token="", model="",
                system_prompt="", max_tokens=512, temperature=0.0,
                timeout=120, grid_columns=4, add_id_labels=True,
@@ -557,7 +637,7 @@ class BeatDropSelectorNode:
 
         folder_info = None  # populated when loading from folders
 
-        if images is None or not isinstance(images, torch.Tensor):
+        if reference_frames is None or not isinstance(reference_frames, torch.Tensor):
             # Try folder-based loading as fallback
             folder_path = str(candidate_folders or "").strip()
             if folder_path:
@@ -574,26 +654,11 @@ class BeatDropSelectorNode:
                 return ("", 0, json.dumps({"error": "no images provided and no candidate_folders set"}),
                         _make_blank_image(), "")
 
-        B = images.shape[0]
-        n_per_window = max(1, min(int(max_frames_per_window), B))
+        B = reference_frames.shape[0]
+        max_total = max(5, int(max_total_frames))
 
-        # Parse extra penalties
-        extra_penalties = {}
-        try:
-            extra_penalties = json.loads(extra_penalty_json or "{}")
-        except Exception:
-            pass
-        if not isinstance(extra_penalties, dict):
-            extra_penalties = {}
-
-        # ── Judge feedback: internal retry when corrections exist ──
-        # If the Judge sent penalties, run selection once without them (discover
-        # what would be selected), then again with corrections applied. The second
-        # pass returns the corrected result.
-        has_judge_corrections = bool(extra_penalties)
-        correction_pass = False  # True during the second (corrected) run
-
-        # Parse beats_used for window boundaries
+        # ── Build job mask for downsampling ──
+        # Parse windows first to know which frames are in job windows
         windows = []
         try:
             bu = json.loads(beats_used or "[]")
@@ -612,10 +677,53 @@ class BeatDropSelectorNode:
             pass
 
         if not windows:
-            # Flat mode: one window = all frames
             windows = [{"batch_start": 0, "batch_end": B,
                         "frame_indices": list(range(B)),
                         "_flat": True}]
+
+        # Build job mask: True for frames inside drop windows
+        job_mask = torch.zeros(B, dtype=torch.bool)
+        for w in windows:
+            job_mask[w["batch_start"]:w["batch_end"]] = True
+
+        # ── Downsample if exceeding max_total_frames ──
+        if B > max_total:
+            reference_frames, job_mask = self._downsample_frames(
+                reference_frames, max_total, job_mask,
+                float(job_fps), float(context_fps), str(downsample_mode),
+            )
+            B = reference_frames.shape[0]
+            # Rebuild windows from downsampled frames
+            # (windows need updating since frame indices changed)
+            windows = [{"batch_start": 0, "batch_end": B,
+                        "frame_indices": list(range(B)),
+                        "_flat": True,
+                        "_downsampled": True}]
+
+        # ── Resize frames for LLM ──
+        max_res = max(64, int(image_resolution))
+        resized = []
+        for i in range(B):
+            resized.append(self._resize_frame(reference_frames[i], max_res))
+        reference_frames = torch.stack(resized, dim=0)
+
+        n_per_window = max(1, min(int(max_frames_per_window), B))
+
+        # Parse extra penalties
+        extra_penalties = {}
+        try:
+            extra_penalties = json.loads(extra_penalty_json or "{}")
+        except Exception:
+            pass
+        if not isinstance(extra_penalties, dict):
+            extra_penalties = {}
+
+        # ── Judge feedback: internal retry when corrections exist ──
+        # If the Judge sent penalties, run selection once without them (discover
+        # what would be selected), then again with corrections applied. The second
+        # pass returns the corrected result.
+        has_judge_corrections = bool(extra_penalties)
+        correction_pass = False  # True during the second (corrected) run
 
         # ── Determine num_outfits: auto_from_beats or manual ──
         if str(num_outfits_mode).strip() == "auto_from_beats":
@@ -727,7 +835,7 @@ class BeatDropSelectorNode:
                 # LLM judging (optional)
                 if use_llm and endpoint and model:
                     try:
-                        win_frames = images[win["batch_start"]:win["batch_end"]]
+                        win_frames = reference_frames[win["batch_start"]:win["batch_end"]]
                         win_pils = _image_batch_to_pil_images(win_frames)
                         labels = [str(i + 1) for i in range(len(win_pils))]
                         cs_sheet = _build_contact_sheet(win_pils, grid_columns, labels if add_id_labels else None)
@@ -797,7 +905,7 @@ class BeatDropSelectorNode:
         contact_sheet = _make_blank_image()
         if all_selected:
             try:
-                sel_tensor = images[torch.tensor(all_selected, dtype=torch.long)]
+                sel_tensor = reference_frames[torch.tensor(all_selected, dtype=torch.long)]
                 sel_pils = _image_batch_to_pil_images(sel_tensor)
                 labels = [f"F{fidx}" for fidx in all_selected]
                 cs_pil = _build_contact_sheet(sel_pils, grid_columns, labels if add_id_labels else None)
