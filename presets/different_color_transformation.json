@@ -1,0 +1,44 @@
+{
+  "extends": "base_fullbody_reference",
+  "name": "Different Color Transformation",
+  "description": "Generic before/after pair with same full-body reference framing but a strong color/style change. No coverage assumption.",
+  "category": "style",
+  "weights": {
+    "scene_fit": 0.70,
+    "change_strength": 0.30,
+    "diversity": 0.0,
+    "reference_match": 0.45,
+    "phase_text_blend": 0.55,
+    "reranker_blend": 0.5
+  },
+  "pair_constraints": [
+    {
+      "source_phase": 0,
+      "target_phase": 1,
+      "match": ["different_color", "strong_visual_change"],
+      "weight": 7.0,
+      "relations": [
+        {
+          "name": "color_brightness",
+          "positive": ["bright colorful saturated vivid clothing colors"],
+          "negative": ["dark black muted monochrome clothing colors"],
+          "direction": "maximize_difference",
+          "weight": 4.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.0,
+          "gate": false
+        }
+      ]
+    }
+  ],
+  "pair_reranker": {
+    "enabled": true,
+    "mode": "transformers",
+    "top_k_per_phase": 24,
+    "max_candidates_per_phase": 72,
+    "max_pairs": 200,
+    "blend_weight": 2.0,
+    "query": "Choose the best before/after pair. Both images must be full-body standing and match the reference pose/camera. Prefer a strong visible outfit/color/style change. The color is allowed and encouraged to change. Reject cropped, lying, sitting, or low-quality images."
+  }
+}

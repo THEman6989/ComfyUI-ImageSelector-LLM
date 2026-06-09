@@ -1,0 +1,91 @@
+{
+  "extends": "base_fullbody_reference",
+  "name": "Strong Visual Change: Covered → Lightly Covered",
+  "description": "Phase 0 starts covered. Phase 1 stays somewhat covered but visibly lighter/more revealing. Color may change; strong visual change is preferred.",
+  "category": "outfit",
+  "weights": {
+    "scene_fit": 0.75,
+    "change_strength": 0.25,
+    "diversity": 0.0,
+    "reference_match": 0.45,
+    "phase_text_blend": 0.55,
+    "reranker_blend": 0.5
+  },
+  "text_query_per_phase": {
+    "0": {
+      "query": "Bild 1 before drop: full-body standing person wearing a covered outfit with clear fabric and clothing coverage",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright pose matching the reference video",
+        "covered outfit with clear fabric coverage, jacket, dress, pants, sleeves, or layered clothing",
+        "complete outfit visible"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "very revealing outfit with minimal fabric",
+        "underwear or swimwear look"
+      ],
+      "filter": {"enabled": true, "threshold": -0.03}
+    },
+    "1": {
+      "query": "Bild 2 after drop: full-body standing person with a clearly changed outfit that is lighter or more revealing but still an outfit",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright pose matching the reference video",
+        "lighter outfit or more open outfit than Bild 1, some exposed skin, less fabric than before",
+        "still covered enough to look like a complete outfit, not underwear only"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "same outfit as before",
+        "extremely revealing underwear-only or nude look"
+      ],
+      "filter": {"enabled": true, "threshold": -0.03}
+    }
+  },
+  "pair_constraints": [
+    {
+      "source_phase": 0,
+      "target_phase": 1,
+      "match": ["strong_visual_change", "different_color"],
+      "weight": 5.0,
+      "relations": [
+        {
+          "name": "coverage",
+          "positive": ["covered outfit, lots of fabric, layered clothing, covered body"],
+          "negative": ["revealing outfit, exposed skin, minimal fabric, open clothing"],
+          "direction": "decrease",
+          "weight": 5.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.45,
+          "gate": false
+        },
+        {
+          "name": "revealing",
+          "positive": ["revealing outfit, exposed skin, less fabric, open clothing"],
+          "negative": ["fully covered outfit, lots of fabric, jacket, dress, layered clothing"],
+          "direction": "increase",
+          "weight": 4.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.45,
+          "gate": false
+        }
+      ]
+    }
+  ],
+  "pair_reranker": {
+    "enabled": true,
+    "mode": "transformers",
+    "top_k_per_phase": 24,
+    "max_candidates_per_phase": 72,
+    "max_pairs": 200,
+    "blend_weight": 2.0,
+    "query": "Choose the best before/after outfit transformation pair. IMAGE 1 must be full-body, standing, and clearly covered. IMAGE 2 must also be full-body and standing, still look like a complete outfit, but be visibly lighter/more revealing than IMAGE 1. Prefer a strong visual change: color may change, silhouette may change, and fabric coverage should decrease. Reject lying/sitting/cropped images and reject extremely nude or underwear-only looks."
+  }
+}

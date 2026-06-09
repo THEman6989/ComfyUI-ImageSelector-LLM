@@ -1,0 +1,63 @@
+{
+  "name": "Base: Full-Body Reference Match",
+  "description": "Generic base preset: prefer full-body standing candidates that match driving-video pose/camera/reference context. No outfit-specific relation is hardcoded.",
+  "category": "base",
+  "weights": {
+    "scene_fit": 0.85,
+    "change_strength": 0.15,
+    "diversity": 0.0,
+    "reference_match": 0.45,
+    "phase_text_blend": 0.55,
+    "reranker_blend": 0.5
+  },
+  "thresholds": {
+    "embedding_confidence": 0.0
+  },
+  "text_query_per_phase": {
+    "0": {
+      "query": "full-body standing person matching the reference video pose and camera framing",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright centered person",
+        "pose and camera framing matching the reference video"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "bad low quality distorted image"
+      ],
+      "filter": {"enabled": true, "threshold": -0.04}
+    },
+    "1": {
+      "query": "full-body standing person matching the reference video pose and camera framing",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright centered person",
+        "pose and camera framing matching the reference video"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "bad low quality distorted image"
+      ],
+      "filter": {"enabled": true, "threshold": -0.04}
+    }
+  },
+  "pair_reranker": {
+    "enabled": true,
+    "mode": "transformers",
+    "top_k_per_phase": 24,
+    "max_candidates_per_phase": 72,
+    "max_pairs": 200,
+    "blend_weight": 2.0,
+    "pair_vlm": {
+      "enabled": false,
+      "max_pairs": 12,
+      "grid_columns": 2
+    }
+  },
+  "max_candidate_images": 82,
+  "use_vlm_fallback": false
+}

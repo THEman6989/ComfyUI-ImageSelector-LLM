@@ -1,0 +1,94 @@
+{
+  "extends": "base_fullbody_reference",
+  "name": "Outfit Transformation",
+  "description": "Phase 0: fully covered dark outfit. Phase 1: more revealing, same dark color family. Both phases must show full-body standing pose matching the reference video.",
+  "category": "outfit",
+  "weights": {
+    "scene_fit": 1.0,
+    "change_strength": 0.0,
+    "diversity": 0.0,
+    "reference_match": 0.55,
+    "phase_text_blend": 0.45,
+    "reranker_blend": 0.5
+  },
+  "text_query_per_phase": {
+    "0": {
+      "query": "Bild 1 before drop: full-body fully covered dark outfit matching the standing reference pose and camera",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright pose matching the reference video",
+        "fully covered outfit, lots of fabric, jacket or dress, modest clothing",
+        "black or very dark outfit color family"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "minimal fabric outfit, exposed skin, underwear or swimwear look",
+        "bright red clothing, white clothing, colorful clothing"
+      ],
+      "filter": {"enabled": true, "threshold": -0.02}
+    },
+    "1": {
+      "query": "Bild 2 after drop: full-body more revealing dark outfit matching the same standing reference pose and camera",
+      "must": [
+        "full body photo showing the entire person head to toe",
+        "standing upright pose matching the reference video",
+        "more revealing outfit, minimal fabric, exposed skin",
+        "black or very dark outfit color family similar to Bild 1"
+      ],
+      "avoid": [
+        "lying down pose",
+        "sitting pose",
+        "cropped close-up or partial body shot",
+        "fully covered outfit, lots of fabric, jacket or dress, modest clothing",
+        "bright red clothing, white clothing, colorful clothing"
+      ],
+      "filter": {"enabled": true, "threshold": -0.02}
+    }
+  },
+  "pair_constraints": [
+    {
+      "source_phase": 0,
+      "target_phase": 1,
+      "match": ["same_color", "same_style_family"],
+      "weight": 8.0,
+      "relations": [
+        {
+          "name": "coverage",
+          "positive": ["covered outfit, lots of fabric, layered clothing, covered body"],
+          "negative": ["revealing outfit, exposed skin, minimal fabric, open clothing"],
+          "direction": "decrease",
+          "weight": 5.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.45,
+          "gate": false
+        },
+        {
+          "name": "revealing",
+          "positive": ["revealing outfit, exposed skin, less fabric, open clothing"],
+          "negative": ["fully covered outfit, lots of fabric, jacket, dress, layered clothing"],
+          "direction": "increase",
+          "weight": 4.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.45,
+          "gate": false
+        }
+      ]
+    }
+  ],
+  "pair_reranker": {
+    "enabled": true,
+    "mode": "transformers",
+    "top_k_per_phase": 24,
+    "max_candidates_per_phase": 72,
+    "max_pairs": 200,
+    "blend_weight": 2.0,
+    "query": "Choose the best before/after outfit pair. IMAGE 1 must be full-body, standing upright, fully covered, and match the reference pose/camera/room. IMAGE 2 must also be full-body and standing upright, match the same reference pose/camera/room, be more revealing, and keep a similar dark outfit color/style. Reject lying down or sitting poses."
+  },
+  "reranker_query": "",
+  "max_candidate_images": 82,
+  "use_vlm_fallback": false
+}

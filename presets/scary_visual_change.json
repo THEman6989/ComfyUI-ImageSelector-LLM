@@ -1,0 +1,58 @@
+{
+  "extends": "base_fullbody_reference",
+  "name": "Scary / Horror Visual Change",
+  "description": "Generic preset for increasing scary/horror/gothic visual feel while keeping full-body reference match. Not outfit-specific.",
+  "category": "style",
+  "weights": {
+    "scene_fit": 0.65,
+    "change_strength": 0.35,
+    "diversity": 0.0,
+    "reference_match": 0.40,
+    "phase_text_blend": 0.60,
+    "reranker_blend": 0.5
+  },
+  "text_query_per_phase": {
+    "0": {
+      "query": "Bild 1 before drop: full-body standing person matching reference pose, neutral or less scary style",
+      "must": ["full body standing person", "reference pose and camera framing", "coherent outfit or look"],
+      "avoid": ["cropped close-up", "lying down", "sitting pose", "bad quality distorted image"],
+      "filter": {"enabled": true, "threshold": -0.04}
+    },
+    "1": {
+      "query": "Bild 2 after drop: full-body standing person with scarier darker horror gothic look",
+      "must": ["full body standing person", "reference pose and camera framing", "scary horror gothic dark creepy visual style"],
+      "avoid": ["cropped close-up", "lying down", "sitting pose", "same neutral look as before", "bad quality distorted image"],
+      "filter": {"enabled": true, "threshold": -0.04}
+    }
+  },
+  "pair_constraints": [
+    {
+      "source_phase": 0,
+      "target_phase": 1,
+      "match": ["strong_visual_change"],
+      "weight": 4.0,
+      "relations": [
+        {
+          "name": "scary",
+          "positive": ["scary horror gothic creepy dark ominous visual style"],
+          "negative": ["cute cheerful bright friendly casual style"],
+          "direction": "increase",
+          "weight": 6.0,
+          "scale": 5.0,
+          "axis_scale": 4.0,
+          "min_score": 0.45,
+          "gate": false
+        }
+      ]
+    }
+  ],
+  "pair_reranker": {
+    "enabled": true,
+    "mode": "transformers",
+    "top_k_per_phase": 24,
+    "max_candidates_per_phase": 72,
+    "max_pairs": 200,
+    "blend_weight": 2.0,
+    "query": "Choose the best before/after pair. Both images must be full-body standing and match reference pose/camera. Prefer a strong visual change where IMAGE 2 becomes scarier, darker, gothic or horror-like compared to IMAGE 1. Reject cropped, lying, sitting, or low-quality images."
+  }
+}
