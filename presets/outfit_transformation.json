@@ -4,12 +4,12 @@
   "description": "Phase 0: fully covered dark outfit. Phase 1: more revealing, same dark color family. Both phases must show full-body standing pose matching the reference video.",
   "category": "outfit",
   "weights": {
-    "scene_fit": 1.0,
-    "change_strength": 0.0,
+    "scene_fit": 0.65,
+    "change_strength": 0.35,
     "diversity": 0.0,
-    "reference_match": 0.55,
-    "phase_text_blend": 0.45,
-    "reranker_blend": 0.5
+    "reference_match": 0.5,
+    "phase_text_blend": 0.65,
+    "reranker_blend": 0.35
   },
   "text_query_per_phase": {
     "0": {
@@ -21,13 +21,14 @@
         "black or very dark outfit color family"
       ],
       "avoid": [
+        "headshot portrait close-up only face",
+        "cropped close-up or partial body shot",
         "lying down pose",
         "sitting pose",
-        "cropped close-up or partial body shot",
         "minimal fabric outfit, exposed skin, underwear or swimwear look",
         "bright red clothing, white clothing, colorful clothing"
       ],
-      "filter": {"enabled": true, "threshold": -0.02}
+      "filter": {"enabled": true, "threshold": 0.0, "hard": true}
     },
     "1": {
       "query": "Bild 2 after drop: full-body more revealing dark outfit matching the same standing reference pose and camera",
@@ -38,13 +39,14 @@
         "black or very dark outfit color family similar to Bild 1"
       ],
       "avoid": [
+        "headshot portrait close-up only face",
+        "cropped close-up or partial body shot",
         "lying down pose",
         "sitting pose",
-        "cropped close-up or partial body shot",
         "fully covered outfit, lots of fabric, jacket or dress, modest clothing",
         "bright red clothing, white clothing, colorful clothing"
       ],
-      "filter": {"enabled": true, "threshold": -0.02}
+      "filter": {"enabled": true, "threshold": 0.0, "hard": true}
     }
   },
   "pair_constraints": [
@@ -52,7 +54,11 @@
       "source_phase": 0,
       "target_phase": 1,
       "match": ["same_color", "same_style_family"],
-      "weight": 8.0,
+      "weight": 10.0,
+      "match_gate": true,
+      "same_min_score": 0.94,
+      "visual_change_min_score": 0.0,
+      "match_gate_penalty": 999.0,
       "relations": [
         {
           "name": "coverage",
@@ -63,7 +69,10 @@
           "scale": 5.0,
           "axis_scale": 4.0,
           "min_score": 0.45,
-          "gate": false
+          "source_min": 0.4,
+          "target_max": 0.4,
+          "gate": true,
+          "gate_penalty": 999.0
         },
         {
           "name": "revealing",
@@ -74,7 +83,10 @@
           "scale": 5.0,
           "axis_scale": 4.0,
           "min_score": 0.45,
-          "gate": false
+          "source_max": 0.63,
+          "target_min": 0.65,
+          "gate": true,
+          "gate_penalty": 999.0
         }
       ]
     }
@@ -82,11 +94,11 @@
   "pair_reranker": {
     "enabled": true,
     "mode": "transformers",
-    "top_k_per_phase": 24,
-    "max_candidates_per_phase": 72,
-    "max_pairs": 200,
-    "blend_weight": 2.0,
-    "query": "Choose the best before/after outfit pair. IMAGE 1 must be full-body, standing upright, fully covered, and match the reference pose/camera/room. IMAGE 2 must also be full-body and standing upright, match the same reference pose/camera/room, be more revealing, and keep a similar dark outfit color/style. Reject lying down or sitting poses."
+    "top_k_per_phase": 30,
+    "max_candidates_per_phase": 80,
+    "max_pairs": 300,
+    "blend_weight": 1.0,
+    "query": "Choose the best before/after outfit pair. IMAGE 1 must be full-body, standing upright, fully covered, and match the reference pose/camera/room. IMAGE 2 must also be full-body and standing upright, match the same reference pose/camera/room, be more revealing, and keep a similar dark outfit color/style. Reject headshots, close-ups, cropped/partial-body images, lying down, or sitting poses."
   },
   "reranker_query": "",
   "max_candidate_images": 82,

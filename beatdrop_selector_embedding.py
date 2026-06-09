@@ -287,14 +287,19 @@ def _phase_semantic_spec(value):
         filter_cfg = value.get("semantic_filter", value.get("filter", value.get("gate", False)))
         filter_enabled = False
         filter_threshold = 0.0
+        hard_filter = False
         if isinstance(filter_cfg, dict):
             filter_enabled = bool(filter_cfg.get("enabled", True))
+            hard_filter = bool(
+                filter_cfg.get("hard", filter_cfg.get("hard_filter", filter_cfg.get("reject", False)))
+            )
             try:
                 filter_threshold = float(filter_cfg.get("threshold", 0.0))
             except (TypeError, ValueError):
                 filter_threshold = 0.0
         else:
             filter_enabled = bool(filter_cfg)
+            hard_filter = bool(value.get("hard_filter", value.get("hard", False)))
             try:
                 filter_threshold = float(value.get("threshold", 0.0))
             except (TypeError, ValueError):
@@ -306,6 +311,7 @@ def _phase_semantic_spec(value):
             "avoid": avoid,
             "filter_enabled": filter_enabled,
             "filter_threshold": filter_threshold,
+            "hard_filter": hard_filter,
         }
 
     text = str(value or "").strip()
@@ -315,6 +321,7 @@ def _phase_semantic_spec(value):
         "avoid": [],
         "filter_enabled": False,
         "filter_threshold": 0.0,
+        "hard_filter": False,
     }
 
 
@@ -429,8 +436,16 @@ def _pair_relation_specs(pair_constraints):
                 gate_penalty = float(rel.get("gate_penalty", 999.0))
             except (TypeError, ValueError):
                 gate_penalty = 999.0
+            absolute_gates = {}
+            for abs_key in ("source_min", "source_max", "target_min", "target_max"):
+                if abs_key not in rel:
+                    continue
+                try:
+                    absolute_gates[abs_key] = float(rel[abs_key])
+                except (TypeError, ValueError):
+                    pass
 
-            specs.append({
+            spec = {
                 "name": name,
                 "query": query,
                 "positive": positives,
@@ -443,7 +458,9 @@ def _pair_relation_specs(pair_constraints):
                 "min_score": min_score,
                 "gate": gate,
                 "gate_penalty": gate_penalty,
-            })
+            }
+            spec.update(absolute_gates)
+            specs.append(spec)
 
     # de-dupe by name+query+positive+negative but keep first scoring config.
     seen = set()
@@ -1538,6 +1555,7 @@ class BeatDropSelectorEmbeddingNode:
                             "avoid": spec.get("avoid", []),
                             "filter_enabled": bool(spec.get("filter_enabled", False)),
                             "filter_threshold": float(spec.get("filter_threshold", 0.0)),
+                            "hard_filter": bool(spec.get("hard_filter", False)),
                             "contrast_mode": "must_minus_avoid" if spec.get("avoid") else "must_only",
                         }
                         if entry["text"]:
@@ -1641,6 +1659,7 @@ class BeatDropSelectorEmbeddingNode:
             avoid_fit = None
             contrast_margin = None
             semantic_filter_failed = False
+            semantic_filter_hard_reject = False
             phase_query = None
             if phase_idx in phase_text_queries:
                 phase_entry = phase_text_queries[phase_idx]
@@ -1691,6 +1710,7 @@ class BeatDropSelectorEmbeddingNode:
                         threshold = float(phase_entry.get("filter_threshold", 0.0))
                         filter_score = contrast_margin if contrast_margin is not None else phase_text_fit
                         semantic_filter_failed = filter_score < threshold
+                        semantic_filter_hard_reject = bool(phase_entry.get("hard_filter", False)) and semantic_filter_failed
                     scene_fit = (1.0 - phase_text_blend_w) * scene_fit + phase_text_blend_w * phase_text_fit
 
             # Generic relation-axis values for pair reasoning. Example axes:
@@ -1732,6 +1752,7 @@ class BeatDropSelectorEmbeddingNode:
                     scores[i]["phase_contrast_mode"] = phase_text_queries[phase_idx].get("contrast_mode", "none")
                 if semantic_filter_failed:
                     scores[i]["semantic_filter_failed"] = True
+                    scores[i]["semantic_filter_hard_reject"] = bool(semantic_filter_hard_reject)
                 scores[i]["phase"] = phase_idx
                 scores[i]["phase_query"] = phase_query
             if relation_axis_values:
@@ -2368,6 +2389,8 @@ class BeatDropSelectorEmbeddingNode:
 
             # Embedding score (invert: high composite = low penalty)
             if embedding_scores and fidx in embedding_scores:
+                if embedding_scores[fidx].get("semantic_filter_hard_reject"):
+                    return 1_000_000.0
                 if embedding_scores[fidx].get("semantic_filter_failed"):
                     s += float(hist_pen) * 10.0
                 emb_score = embedding_scores[fidx]["composite"]
@@ -2527,8 +2550,12 @@ class BeatDropSelectorEmbeddingNode:
 
                 pair_items = []
                 for sidx, s0 in source_ranked:
+                    if s0 >= 999_000.0:
+                        continue
                     for tidx, _ in target_ranked:
                         s1 = _score_frame(tidx, extra_penalties, [sidx], n_per_window, hist_pen)
+                        if s1 >= 999_000.0:
+                            continue
                         if image_stems_by_frame.get(sidx) and image_stems_by_frame.get(sidx) == image_stems_by_frame.get(tidx):
                             s1 += hist_pen * 10.0
                         color_sim = _color_similarity(color_sigs[sidx], color_sigs[tidx])
@@ -2543,18 +2570,63 @@ class BeatDropSelectorEmbeddingNode:
                         pair_same_score = 0.0
                         pair_diff_score = 0.0
                         pair_match_parts = []
+                        pair_match_gate_failed = False
+                        pair_match_gate_penalty = 0.0
+                        pair_match_gate = bool(pc.get("match_gate", pc.get("same_color_gate", False)))
+                        try:
+                            default_match_min = float(pc.get("match_min_score", pc.get("same_min_score", 0.0)))
+                        except (TypeError, ValueError):
+                            default_match_min = 0.0
+                        try:
+                            diff_min_score = float(pc.get("diff_min_score", pc.get("visual_change_min_score", 0.0)))
+                        except (TypeError, ValueError):
+                            diff_min_score = 0.0
+                        try:
+                            pair_match_gate_penalty_value = float(pc.get("match_gate_penalty", pc.get("gate_penalty", 999.0)))
+                        except (TypeError, ValueError):
+                            pair_match_gate_penalty_value = 999.0
                         if any(m in same_flags for m in match):
                             # Back-compat path: old same_color+same_style_family behavior.
                             pair_same_score = 0.35 * color_sim + 0.65 * image_sim
-                            pair_match_parts.append({"mode": "same", "score": pair_same_score})
+                            gate_ok = pair_same_score >= default_match_min if default_match_min > 0 else True
+                            if pair_match_gate and not gate_ok:
+                                pair_match_gate_failed = True
+                                pair_match_gate_penalty += pair_match_gate_penalty_value
+                            pair_match_parts.append({
+                                "mode": "same",
+                                "score": pair_same_score,
+                                "min_score": default_match_min,
+                                "gate": pair_match_gate,
+                                "gate_ok": gate_ok,
+                            })
                         if any(m in diff_color_flags for m in match):
                             color_diff_score = 1.0 - color_sim
+                            gate_ok = color_diff_score >= diff_min_score if diff_min_score > 0 else True
+                            if pair_match_gate and not gate_ok:
+                                pair_match_gate_failed = True
+                                pair_match_gate_penalty += pair_match_gate_penalty_value
                             pair_diff_score += color_diff_score
-                            pair_match_parts.append({"mode": "different_color", "score": color_diff_score})
+                            pair_match_parts.append({
+                                "mode": "different_color",
+                                "score": color_diff_score,
+                                "min_score": diff_min_score,
+                                "gate": pair_match_gate,
+                                "gate_ok": gate_ok,
+                            })
                         if any(m in diff_visual_flags for m in match):
                             visual_diff_score = 1.0 - image_sim
+                            gate_ok = visual_diff_score >= diff_min_score if diff_min_score > 0 else True
+                            if pair_match_gate and not gate_ok:
+                                pair_match_gate_failed = True
+                                pair_match_gate_penalty += pair_match_gate_penalty_value
                             pair_diff_score += visual_diff_score
-                            pair_match_parts.append({"mode": "visual_change", "score": visual_diff_score})
+                            pair_match_parts.append({
+                                "mode": "visual_change",
+                                "score": visual_diff_score,
+                                "min_score": diff_min_score,
+                                "gate": pair_match_gate,
+                                "gate_ok": gate_ok,
+                            })
 
                         # If only generic relations exist, pair_match_score can stay 0;
                         # relation rewards below carry the pair decision.
@@ -2580,6 +2652,31 @@ class BeatDropSelectorEmbeddingNode:
                             min_score = float(rel.get("min_score", 0.0))
                             gate = bool(rel.get("gate", False))
                             gate_ok = rel_score >= min_score if min_score > 0 else True
+                            absolute_gate_checks = []
+                            for abs_key, actual in (
+                                ("source_min", src_axes.get(axis_name)),
+                                ("source_max", src_axes.get(axis_name)),
+                                ("target_min", tgt_axes.get(axis_name)),
+                                ("target_max", tgt_axes.get(axis_name)),
+                            ):
+                                if abs_key not in rel or actual is None:
+                                    continue
+                                try:
+                                    threshold_abs = float(rel.get(abs_key))
+                                    actual_abs = float(actual)
+                                except (TypeError, ValueError):
+                                    continue
+                                if abs_key.endswith("_min"):
+                                    ok_abs = actual_abs >= threshold_abs
+                                else:
+                                    ok_abs = actual_abs <= threshold_abs
+                                absolute_gate_checks.append({
+                                    "key": abs_key,
+                                    "actual": round(actual_abs, 4),
+                                    "threshold": round(threshold_abs, 4),
+                                    "ok": ok_abs,
+                                })
+                                gate_ok = gate_ok and ok_abs
                             if gate and not gate_ok:
                                 relation_gate_failed = True
                                 relation_gate_penalty += float(rel.get("gate_penalty", 999.0))
@@ -2595,10 +2692,11 @@ class BeatDropSelectorEmbeddingNode:
                                 "min_score": round(float(min_score), 4),
                                 "gate": gate,
                                 "gate_ok": gate_ok,
+                                "absolute_gates": absolute_gate_checks,
                                 "weight": round(float(rel_weight), 4),
                             })
 
-                        heuristic_total = s0 + s1 - weight * pair_sim - relation_total + relation_gate_penalty
+                        heuristic_total = s0 + s1 - weight * pair_sim - relation_total + relation_gate_penalty + pair_match_gate_penalty
                         pair_items.append({
                             "source": sidx,
                             "target": tidx,
@@ -2606,6 +2704,8 @@ class BeatDropSelectorEmbeddingNode:
                             "color_similarity": color_sim,
                             "image_similarity": image_sim,
                             "pair_match_parts": pair_match_parts,
+                            "pair_match_gate_failed": pair_match_gate_failed,
+                            "pair_match_gate_penalty": pair_match_gate_penalty,
                             "relation_total": relation_total,
                             "relation_details": relation_details,
                             "relation_gate_failed": relation_gate_failed,
