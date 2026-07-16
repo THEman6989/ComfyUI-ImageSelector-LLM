@@ -135,8 +135,8 @@ class BeatDropConfigPipe:
                 }),
                 # ── Limits ──
                 "max_frames_per_window": ("INT", {
-                    "default": 4, "min": 2, "max": 20,
-                    "tooltip": "Max frames per drop window.",
+                    "default": 1, "min": 1, "max": 20,
+                    "tooltip": "Outfit candidates selected per phase. 1 = one before/after outfit.",
                 }),
                 "max_candidate_images": ("INT", {
                     "default": 30, "min": 5, "max": 500, "step": 5,
@@ -226,7 +226,7 @@ class BeatDropConfigPipe:
         reranker_confidence_threshold=0.70,
         history_penalty=10.0,
         history_decay_rate=0.3,
-        max_frames_per_window=4,
+        max_frames_per_window=1,
         max_candidate_images=30,
         use_vlm_fallback=False,
         folder_assignments_json="",
@@ -314,7 +314,7 @@ class BeatDropConfigPipe:
         # the user changed them. Otherwise the ConfigPipe silently overrides the
         # Selector node's own max_frames_per_window/max_candidate_images values.
         if preset_data:
-            if _was_changed(max_frames_per_window, 4.0):
+            if _was_changed(max_frames_per_window, 1.0):
                 cfg["max_frames_per_window"] = max_frames_per_window
             if _was_changed(max_candidate_images, 30.0):
                 cfg["max_candidate_images"] = max_candidate_images

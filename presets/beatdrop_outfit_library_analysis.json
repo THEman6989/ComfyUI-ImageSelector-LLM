@@ -1,0 +1,62 @@
+{
+  "extends": "base_fullbody_reference",
+  "name": "BeatDrop Outfit Library Analysis",
+  "description": "Generic analysis-only preset: rank a separate outfit library against video scene/pose references and choose one visibly different before/after pair without hard coverage gates.",
+  "category": "outfit",
+  "weights": {
+    "scene_fit": 0.45,
+    "change_strength": 0.35,
+    "diversity": 0.20,
+    "reference_match": 0.45,
+    "phase_text_blend": 0.55,
+    "reranker_blend": 0.35
+  },
+  "text_query_scene_fit": "full-body outfit candidate with framing, pose, silhouette and camera compatibility with the driving-video reference scene",
+  "text_query_change_target": "clear visible outfit transformation with a different silhouette, cut, shape or styling while preserving full-body usability",
+  "text_query_per_phase": {
+    "0": {
+      "query": "before-drop outfit: complete full-body outfit with pose and framing compatible with the video reference",
+      "must": [
+        "complete outfit visible head to toe",
+        "standing or pose-compatible full-body fashion image",
+        "clear clothing silhouette and garment shape"
+      ],
+      "avoid": [
+        "face-only portrait",
+        "cropped image hiding most of the outfit",
+        "product-only image without a wearable outfit"
+      ],
+      "filter": {"enabled": false, "threshold": -0.05, "hard": false}
+    },
+    "1": {
+      "query": "after-drop outfit: complete full-body outfit with a strong visible change in silhouette, cut, shape or styling",
+      "must": [
+        "complete outfit visible head to toe",
+        "standing or pose-compatible full-body fashion image",
+        "visibly different clothing silhouette, cut, shape or styling from the before-drop outfit"
+      ],
+      "avoid": [
+        "face-only portrait",
+        "cropped image hiding most of the outfit",
+        "product-only image without a wearable outfit"
+      ],
+      "filter": {"enabled": false, "threshold": -0.05, "hard": false}
+    }
+  },
+  "pair_constraints": [
+    {
+      "source_phase": 0,
+      "target_phase": 1,
+      "match": ["strong_visual_change"],
+      "weight": 7.0,
+      "match_gate": false,
+      "visual_change_min_score": 0.25
+    }
+  ],
+  "pair_reranker": {
+    "enabled": false
+  },
+  "max_frames_per_window": 1,
+  "max_candidate_images": 16,
+  "use_vlm_fallback": false
+}

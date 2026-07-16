@@ -157,3 +157,6 @@ input/
 config.json
 secrets.json
 api_keys.txt
+
+# Local Graphify/embedding artifacts
+graphify-out/

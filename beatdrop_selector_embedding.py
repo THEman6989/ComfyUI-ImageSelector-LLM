@@ -12,6 +12,7 @@ folder-loading, downsampling, and contact-sheet helpers from the parent module.
 Place in: ComfyUI-ImageSelector-LLM/beatdrop_selector_embedding.py
 """
 
+import hashlib
 import json
 import re
 import torch
@@ -557,8 +558,8 @@ class BeatDropSelectorEmbeddingNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "max_frames_per_window": ("INT", {"default": 4, "min": 2, "max": 20,
-                    "tooltip": "Max frames per drop window. For 2+ outfits."}),
+                "max_frames_per_window": ("INT", {"default": 1, "min": 1, "max": 20,
+                    "tooltip": "Outfit candidates selected per phase. 1 = one before/after outfit per drop."}),
                 "num_outfits_mode": (["auto_from_beats", "manual"], {"default": "auto_from_beats",
                     "tooltip": "auto_from_beats: derive from beats_used windows."}),
                 "num_outfits": ("INT", {"default": 2, "min": 2, "max": 10, "step": 1,
@@ -567,8 +568,9 @@ class BeatDropSelectorEmbeddingNode:
             "optional": {
                 # ── Pre-loaded embedding model (from QwenVLEmbeddingLoader) ──
                 "embedding_model": ("QWEN_VL_EMBEDDING", {"tooltip": "Connect QwenVLEmbeddingLoader here. Overrides embedding_model_path if connected."}),
-                "reference_frames": ("IMAGE", {"tooltip": "Video frames from FrameSequenceGenerator"}),
-                "context_frames": ("IMAGE", {"tooltip": "Video frames OUTSIDE drop windows (low fps context)"}),
+                "reference_frames": ("IMAGE", {"tooltip": "VIDEO reference frames from FrameSequenceGenerator. Used only for scene/pose/timing context, never as outfit candidates when a candidate source is connected."}),
+                "context_frames": ("IMAGE", {"tooltip": "Additional VIDEO context frames. Used only for scene context, never selected as outfits."}),
+                "outfit_candidates": ("IMAGE", {"tooltip": "Optional pre-loaded OUTFIT candidate batch. Separate from video reference_frames. candidate_folders takes priority when set."}),
                 "beats_used": ("STRING", {"default": "", "multiline": True,
                     "placeholder": "beats_used JSON from FrameSequenceGenerator"}),
 
@@ -1395,6 +1397,158 @@ class BeatDropSelectorEmbeddingNode:
         }
         return images_tensor, info
 
+    @staticmethod
+    def _windows_from_beats(beats_used, frame_count, flat_fallback=True):
+        """Map FrameSequenceGenerator window metadata onto one IMAGE batch."""
+        windows = []
+        try:
+            entries = json.loads(beats_used or "[]")
+        except (json.JSONDecodeError, TypeError):
+            entries = []
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                offset = int(entry.get("batch_offset", -1))
+                count = int(entry.get("batch_frame_count", 0))
+                if offset < 0 or count <= 0 or offset >= int(frame_count):
+                    continue
+                end = min(int(frame_count), offset + count)
+                windows.append({
+                    **entry,
+                    "batch_start": offset,
+                    "batch_end": end,
+                    "frame_indices": list(range(offset, end)),
+                })
+        if not windows and flat_fallback and int(frame_count) > 0:
+            windows = [{
+                "batch_start": 0,
+                "batch_end": int(frame_count),
+                "frame_indices": list(range(int(frame_count))),
+                "_flat": True,
+            }]
+        return windows
+
+    @staticmethod
+    def _required_outfit_states(beat_count, mode="auto_from_beats", manual_count=2):
+        """N beat transitions require N+1 distinct outfit states."""
+        if str(mode).strip() == "auto_from_beats":
+            return max(2, int(beat_count) + 1)
+        return max(2, int(manual_count))
+
+    @staticmethod
+    def _candidate_source_identity(frame_index, image_paths, candidate_frames):
+        """Return stable identity across per-phase copies of one outfit candidate."""
+        frame_index = int(frame_index)
+        source_path = image_paths.get(frame_index) if isinstance(image_paths, dict) else None
+        if source_path:
+            return f"path:{Path(source_path).expanduser().resolve()}"
+        frame = (
+            candidate_frames[frame_index].detach().clamp(0, 1).mul(255)
+            .round().to(torch.uint8).cpu().contiguous().numpy()
+        )
+        return f"sha256:{hashlib.sha256(frame.tobytes()).hexdigest()}"
+
+    @staticmethod
+    def _candidate_windows_from_folder_info(folder_info, candidate_count, scene_windows=None):
+        """Build selection windows from per-phase folder loading boundaries."""
+        windows = []
+        offset = 0
+        phase_info = folder_info.get("phase_info", []) if isinstance(folder_info, dict) else []
+        for item in phase_info:
+            if not isinstance(item, dict):
+                continue
+            count = max(0, int(item.get("images_loaded", 0)))
+            end = min(int(candidate_count), offset + count)
+            if end <= offset:
+                continue
+            window = {
+                "phase": int(item.get("phase", len(windows))),
+                "folder": str(item.get("folder", "")),
+                "batch_start": offset,
+                "batch_end": end,
+                "frame_indices": list(range(offset, end)),
+            }
+            phase = window["phase"]
+            if scene_windows:
+                scene = scene_windows[min(phase, len(scene_windows) - 1)]
+                for key in (
+                    "beat_index", "time_seconds", "frame_index", "is_drop",
+                    "range_start", "range_end", "frames",
+                ):
+                    if key in scene:
+                        window[key] = scene[key]
+            windows.append(window)
+            offset = end
+        return windows
+
+    @staticmethod
+    def _repeat_candidate_pool_for_phases(candidate_frames, phase_count):
+        """Give each phase an independent view of one pre-loaded candidate pool."""
+        phase_count = max(1, int(phase_count))
+        base_count = int(candidate_frames.shape[0])
+        repeated = torch.cat([candidate_frames] * phase_count, dim=0)
+        windows = []
+        for phase in range(phase_count):
+            start = phase * base_count
+            end = start + base_count
+            windows.append({
+                "phase": phase,
+                "folder": "_input",
+                "batch_start": start,
+                "batch_end": end,
+                "frame_indices": list(range(start, end)),
+            })
+        return repeated, windows
+
+    @staticmethod
+    def _downsample_scene_references(frames, windows, max_frames):
+        """Cap video-reference embeddings while preserving per-phase boundaries."""
+        total = int(frames.shape[0])
+        cap = max(1, int(max_frames))
+        if total <= cap:
+            return frames, windows
+        valid = [
+            w for w in (windows or [])
+            if int(w.get("batch_end", 0)) > int(w.get("batch_start", 0))
+        ]
+        if not valid:
+            keep = torch.linspace(0, total - 1, cap).round().long()
+            return frames[keep], [{
+                "batch_start": 0,
+                "batch_end": cap,
+                "frame_indices": list(range(cap)),
+                "_flat": True,
+                "_downsampled": True,
+            }]
+
+        active = valid[:cap]
+        base = cap // len(active)
+        remainder = cap % len(active)
+        selected = []
+        rebuilt = []
+        offset = 0
+        for phase_index, window in enumerate(active):
+            start = max(0, int(window.get("batch_start", 0)))
+            end = min(total, int(window.get("batch_end", total)))
+            available = max(0, end - start)
+            quota = min(available, base + (1 if phase_index < remainder else 0))
+            if quota <= 0:
+                continue
+            local = torch.linspace(start, end - 1, quota).round().long()
+            selected.append(local)
+            mapped = {
+                **window,
+                "batch_start": offset,
+                "batch_end": offset + quota,
+                "frame_indices": list(range(offset, offset + quota)),
+                "_downsampled": True,
+            }
+            rebuilt.append(mapped)
+            offset += quota
+        keep = torch.cat(selected) if selected else torch.tensor([0], dtype=torch.long)
+        return frames[keep], rebuilt
+
     # ═══════════════════════════════════════════════════════════════════
     # Frame management (copied from BeatDropSelectorNode)
     # ═══════════════════════════════════════════════════════════════════
@@ -1463,8 +1617,11 @@ class BeatDropSelectorEmbeddingNode:
                                  preloaded_model=None,
                                  phase_text_blend_weight=0.80,
                                  pair_constraints_json="[]",
-                                 cached_frame_embs=None):
-        """Compute embedding-based scores for all frames.
+                                 cached_frame_embs=None,
+                                 scene_reference_frames=None,
+                                 scene_windows=None,
+                                 scene_context_frames=None):
+        """Score outfit candidates against independent video scene references.
 
         If preloaded_model is provided (from QwenVLEmbeddingLoader), uses that
         instead of loading from model_path. The preloaded_model is a cache_key
@@ -1481,6 +1638,7 @@ class BeatDropSelectorEmbeddingNode:
             model, processor, dim = _QWEN_EMBEDDING_CACHE[cache_key]
             # Override model_path/device/dtype from cache
             actual_model_path, actual_device, actual_dtype = cache_key
+            model_path, device, dtype_str = actual_model_path, actual_device, actual_dtype
             print(f"[EmbeddingMatcher] Using preloaded model: {actual_model_path} ({actual_device}/{actual_dtype})")
         else:
             if not model_path:
@@ -1508,18 +1666,48 @@ class BeatDropSelectorEmbeddingNode:
                 model, processor, reference_frames, device, batch_size=4,
             )  # (B, dim)
 
-        # ── Scene embedding: mean-pool frames OUTSIDE windows as "scene reference" ──
-        in_window = torch.zeros(B, dtype=torch.bool)
-        for win in windows:
-            in_window[win["batch_start"]:win["batch_end"]] = True
-
-        if in_window.sum() < B:
-            scene_emb = frame_embs[~in_window].mean(dim=0, keepdim=True)
-            scene_emb = F.normalize(scene_emb, p=2, dim=1)
+        # ── Scene embeddings come from VIDEO references, never outfit candidates ──
+        phase_scene_embs = {}
+        scene_reference_count = 0
+        independent_scene_source = (
+            isinstance(scene_reference_frames, torch.Tensor)
+            and int(scene_reference_frames.shape[0]) > 0
+        )
+        if independent_scene_source:
+            scene_reference_count = int(scene_reference_frames.shape[0])
+            scene_ref_embs = _compute_embeddings_batch(
+                model, processor, scene_reference_frames, device, batch_size=4,
+            )
+            global_parts = [scene_ref_embs]
+            if isinstance(scene_context_frames, torch.Tensor) and int(scene_context_frames.shape[0]) > 0:
+                context_embs = _compute_embeddings_batch(
+                    model, processor, scene_context_frames, device, batch_size=4,
+                )
+                global_parts.append(context_embs)
+                scene_reference_count += int(scene_context_frames.shape[0])
+            scene_emb = F.normalize(
+                torch.cat(global_parts, dim=0).mean(dim=0, keepdim=True), p=2, dim=1,
+            )
+            for phase_idx, win in enumerate(scene_windows or []):
+                start = max(0, int(win.get("batch_start", 0)))
+                end = min(int(scene_ref_embs.shape[0]), int(win.get("batch_end", 0)))
+                if end <= start:
+                    continue
+                phase_mean = F.normalize(
+                    scene_ref_embs[start:end].mean(dim=0, keepdim=True), p=2, dim=1,
+                )
+                phase_scene_embs[phase_idx] = F.normalize(
+                    0.75 * phase_mean + 0.25 * scene_emb, p=2, dim=1,
+                )
         else:
-            # All frames are in windows — use mean of all frames
-            scene_emb = frame_embs.mean(dim=0, keepdim=True)
-            scene_emb = F.normalize(scene_emb, p=2, dim=1)
+            # Legacy mode: candidates and references are the same batch.
+            in_window = torch.zeros(B, dtype=torch.bool)
+            for win in windows:
+                in_window[win["batch_start"]:win["batch_end"]] = True
+            if in_window.sum() < B:
+                scene_emb = F.normalize(frame_embs[~in_window].mean(dim=0, keepdim=True), p=2, dim=1)
+            else:
+                scene_emb = F.normalize(frame_embs.mean(dim=0, keepdim=True), p=2, dim=1)
 
         # ── Text query embeddings (semantic matching) ──
         text_queries = {}
@@ -1611,9 +1799,11 @@ class BeatDropSelectorEmbeddingNode:
         scores = {}
         for i in range(B):
             frame_emb = frame_embs[i:i+1]  # (1, dim)
+            phase_idx = frame_to_phase.get(i)
+            target_scene_emb = phase_scene_embs.get(phase_idx, scene_emb)
 
-            # Scene fit: cosine similarity to scene embedding
-            scene_fit = float(F.cosine_similarity(frame_emb, scene_emb).item())
+            # Scene fit: candidate outfit ↔ corresponding VIDEO phase reference.
+            scene_fit = float(F.cosine_similarity(frame_emb, target_scene_emb).item())
             scene_fit = (scene_fit + 1.0) / 2.0  # [-1, 1] → [0, 1]
 
             # Text-query scene fit (if provided)
@@ -1624,21 +1814,27 @@ class BeatDropSelectorEmbeddingNode:
                 # Blend: 50% visual scene, 50% text-query scene
                 scene_fit = 0.5 * scene_fit + 0.5 * text_scene_fit
 
-            # Change strength: average distance to frames in OTHER windows
-            change_scores = []
-            for other_win in windows:
-                if other_win["batch_start"] <= i < other_win["batch_end"]:
-                    continue  # skip own window
-                ow_start = other_win["batch_start"]
-                ow_end = min(other_win["batch_end"], B)
-                if ow_end > ow_start:
-                    other_embs = frame_embs[ow_start:ow_end]
-                    dists = 1.0 - F.cosine_similarity(
-                        frame_emb.expand(other_embs.shape[0], -1), other_embs,
-                    )
-                    change_scores.append(float(dists.mean().item()))
-
-            change_strength = float(np.mean(change_scores)) if change_scores else 0.5
+            if independent_scene_source:
+                # Outfit-change strength is measured against the driving-video
+                # reference, not by treating video frames as selectable outfits.
+                change_strength = float(
+                    1.0 - F.cosine_similarity(frame_emb, target_scene_emb).item()
+                )
+            else:
+                # Legacy fallback: average distance to candidates in other windows.
+                change_scores = []
+                for other_win in windows:
+                    if other_win["batch_start"] <= i < other_win["batch_end"]:
+                        continue
+                    ow_start = other_win["batch_start"]
+                    ow_end = min(other_win["batch_end"], B)
+                    if ow_end > ow_start:
+                        other_embs = frame_embs[ow_start:ow_end]
+                        dists = 1.0 - F.cosine_similarity(
+                            frame_emb.expand(other_embs.shape[0], -1), other_embs,
+                        )
+                        change_scores.append(float(dists.mean().item()))
+                change_strength = float(np.mean(change_scores)) if change_scores else 0.5
 
             # Text-query change target (if provided)
             if "change_target" in text_queries:
@@ -1652,7 +1848,6 @@ class BeatDropSelectorEmbeddingNode:
             # avoid=["cropped close-up", "red clothing"]. This stays generic:
             # the node does not know clothing classes; it only computes
             # must-similarity minus avoid-similarity.
-            phase_idx = frame_to_phase.get(i)
             phase_text_fit = None
             raw_phase_fit = None
             must_fit = None
@@ -1779,6 +1974,9 @@ class BeatDropSelectorEmbeddingNode:
             "dtype": dtype_str,
             "dim": dim,
             "frames_embedded": B,
+            "candidate_frames_embedded": B,
+            "scene_reference_frames_embedded": scene_reference_count,
+            "scene_embedding_source": "video_references" if independent_scene_source else "legacy_candidate_batch",
             "frame_embedding_source": "sqlite_cache" if cache_used_for_frames else "model",
             "scene_fit_weight": scene_fit_w,
             "change_strength_weight": change_w,
@@ -1941,7 +2139,7 @@ class BeatDropSelectorEmbeddingNode:
 
     def select(self, max_frames_per_window, num_outfits_mode, num_outfits,
                embedding_model=None,  # ← from QwenVLEmbeddingLoader
-               reference_frames=None, context_frames=None, beats_used="",
+               reference_frames=None, context_frames=None, outfit_candidates=None, beats_used="",
                # Stage 1 (scoring params only — model comes from embedding_model)
                embedding_confidence_threshold=0.75,
                embedding_scene_fit_weight=0.30,
@@ -2038,118 +2236,101 @@ class BeatDropSelectorEmbeddingNode:
             except (json.JSONDecodeError, ValueError, TypeError) as e:
                 print(f"[EmbeddingMatcher] AI Stack config parse error: {e}")
 
-        # ── Load images ──
-        folder_info = None  # populated when loading from folders
-        if reference_frames is None or not isinstance(reference_frames, torch.Tensor):
-            folder_path = str(candidate_folders or "").strip()
-            if folder_path:
-                history = self._load_history(history_file)
+        # ── Keep scene references and outfit candidates as independent tensors ──
+        scene_reference_frames = (
+            reference_frames if isinstance(reference_frames, torch.Tensor) else None
+        )
+        scene_count = int(scene_reference_frames.shape[0]) if scene_reference_frames is not None else 0
+        scene_windows = self._windows_from_beats(beats_used, scene_count, flat_fallback=True)
+        required_outfit_states = self._required_outfit_states(
+            len(scene_windows), num_outfits_mode, num_outfits,
+        )
+        phase_count = (
+            required_outfit_states
+            if str(num_outfits_mode).strip() == "auto_from_beats"
+            else max(2, len(scene_windows) if scene_windows else 2)
+        )
 
-                # Parse windows early for embedding-based folder assignment
-                try:
-                    bu_early = json.loads(beats_used or "[]")
-                    early_windows = []
-                    if isinstance(bu_early, list):
-                        for entry in bu_early:
-                            offset = int(entry.get("batch_offset", -1))
-                            count = int(entry.get("batch_frame_count", 0))
-                            if offset >= 0 and count > 0:
-                                early_windows.append({
-                                    **entry,
-                                    "batch_start": offset,
-                                    "batch_end": offset + count,
-                                })
-                    nw = max(2, len(early_windows) if early_windows else 2)
-                except Exception:
-                    early_windows = []
-                    nw = 2
+        folder_info = None
+        candidate_source = "none"
+        folder_path = str(candidate_folders or "").strip()
+        if folder_path:
+            history = self._load_history(history_file)
+            folder_embedding_model_path = ""
+            folder_embedding_device = "auto"
+            folder_embedding_dtype = "fp16"
+            if isinstance(embedding_model, (tuple, list)) and len(embedding_model) >= 3:
+                folder_embedding_model_path = str(embedding_model[0])
+                folder_embedding_device = str(embedding_model[1])
+                folder_embedding_dtype = str(embedding_model[2])
 
-                folder_embedding_model_path = ""
-                folder_embedding_device = "auto"
-                folder_embedding_dtype = "fp16"
-                if not folder_embedding_model_path and isinstance(embedding_model, (tuple, list)) and len(embedding_model) >= 3:
-                    folder_embedding_model_path = str(embedding_model[0])
-                    folder_embedding_device = str(embedding_model[1])
-                    folder_embedding_dtype = str(embedding_model[2])
-
-                images, folder_info = self._load_from_folders(
-                    folder_path, history, history_penalty, history_decay_rate,
-                    max_candidate_images, use_random_sample, num_windows=nw,
-                    folder_assignments_json=folder_assignments_json,
-                    text_query_per_phase_json=text_query_per_phase_json,
-                    embedding_model_path=folder_embedding_model_path,
-                    embedding_device=folder_embedding_device,
-                    embedding_dtype=folder_embedding_dtype,
-                    reference_frames=None,  # video frames not yet loaded
-                    windows=early_windows if early_windows else None,
-                    use_embedding_cache=use_embedding_cache,
-                    cache_db_path=cache_db_path,
-                    min_image_height=min_image_height,
-                    min_aspect_ratio=min_aspect_ratio,
-                )
-                if images is None:
-                    return ("", 0, json.dumps({"error": "no images in folders"}),
-                            _make_blank_image(), "", "")
-                reference_frames = images
-            else:
-                return ("", 0, json.dumps({"error": "no images provided and no candidate_folders set"}),
+            candidate_frames, folder_info = self._load_from_folders(
+                folder_path, history, history_penalty, history_decay_rate,
+                max_candidate_images, use_random_sample, num_windows=phase_count,
+                folder_assignments_json=folder_assignments_json,
+                text_query_per_phase_json=text_query_per_phase_json,
+                embedding_model_path=folder_embedding_model_path,
+                embedding_device=folder_embedding_device,
+                embedding_dtype=folder_embedding_dtype,
+                reference_frames=scene_reference_frames,
+                windows=scene_windows if scene_windows else None,
+                use_embedding_cache=use_embedding_cache,
+                cache_db_path=cache_db_path,
+                min_image_height=min_image_height,
+                min_aspect_ratio=min_aspect_ratio,
+            )
+            if candidate_frames is None:
+                return ("", 0, json.dumps({"error": "no outfit images in candidate_folders"}),
                         _make_blank_image(), "", "")
+            candidate_source = "folders"
+            windows = self._candidate_windows_from_folder_info(
+                folder_info, int(candidate_frames.shape[0]), scene_windows=scene_windows,
+            )
+        elif isinstance(outfit_candidates, torch.Tensor):
+            candidate_frames, windows = self._repeat_candidate_pool_for_phases(
+                outfit_candidates, phase_count,
+            )
+            candidate_source = "input"
+            folder_info = {
+                "source": "input",
+                "root": "",
+                "phase_info": [
+                    {"phase": w["phase"], "folder": "_input", "images_loaded": len(w["frame_indices"])}
+                    for w in windows
+                ],
+                "folder_assignments": [],
+                "images_loaded": int(candidate_frames.shape[0]),
+                "max_candidate_images": int(outfit_candidates.shape[0]),
+                "max_per_phase": int(outfit_candidates.shape[0]),
+                "embedding_cache": {"enabled": False},
+            }
+        elif scene_reference_frames is not None:
+            # Backward-compatible legacy mode. New workflows should always wire a
+            # separate outfit candidate source so video frames cannot be selected.
+            candidate_frames = scene_reference_frames
+            windows = scene_windows
+            candidate_source = "legacy_reference_frames"
+        else:
+            return ("", 0, json.dumps({"error": "no outfit_candidates or candidate_folders set"}),
+                    _make_blank_image(), "", "")
 
-        B = reference_frames.shape[0]
-        max_total = max(5, int(max_total_frames))
-
-        # ── Parse windows from beats_used ──
-        windows = []
-        try:
-            bu = json.loads(beats_used or "[]")
-            if isinstance(bu, list):
-                for entry in bu:
-                    offset = int(entry.get("batch_offset", -1))
-                    count = int(entry.get("batch_frame_count", 0))
-                    if offset >= 0 and count > 0 and offset < B:
-                        windows.append({
-                            **entry,
-                            "batch_start": offset,
-                            "batch_end": min(B, offset + count),
-                            "frame_indices": list(range(offset, min(B, offset + count))),
-                        })
-        except Exception:
-            pass
-
+        B = int(candidate_frames.shape[0])
         if not windows:
             windows = [{"batch_start": 0, "batch_end": B,
                         "frame_indices": list(range(B)), "_flat": True}]
 
-        # ── Build job mask + merge context frames ──
-        job_mask = torch.zeros(B, dtype=torch.bool)
-        for w in windows:
-            job_mask[w["batch_start"]:w["batch_end"]] = True
-
-        if context_frames is not None and isinstance(context_frames, torch.Tensor):
-            ctx_B = context_frames.shape[0]
-            if ctx_B > 0:
-                # Folder candidates and driving-video frames often have different
-                # H/W. Resize context frames to candidate tensor size before cat;
-                # otherwise reference matching crashes before embedding.
-                if context_frames.shape[1] != reference_frames.shape[1] or context_frames.shape[2] != reference_frames.shape[2]:
-                    context_frames = F.interpolate(
-                        context_frames.permute(0, 3, 1, 2),
-                        size=(reference_frames.shape[1], reference_frames.shape[2]),
-                        mode="bilinear",
-                        align_corners=False,
-                    ).permute(0, 2, 3, 1)
-                ctx_mask = torch.zeros(ctx_B, dtype=torch.bool)
-                reference_frames = torch.cat([reference_frames, context_frames], dim=0)
-                job_mask = torch.cat([job_mask, ctx_mask], dim=0)
-                B = reference_frames.shape[0]
+        # Context frames remain scene-only. They are never appended to candidate_frames.
+        scene_context_frames = context_frames if isinstance(context_frames, torch.Tensor) else None
+        max_total = max(5, int(max_total_frames))
+        job_mask = torch.ones(B, dtype=torch.bool)
 
         # ── Downsample ──
         if B > max_total:
-            reference_frames, job_mask = self._downsample_frames(
-                reference_frames, max_total, job_mask,
+            candidate_frames, job_mask = self._downsample_frames(
+                candidate_frames, max_total, job_mask,
                 float(job_fps), float(context_fps), str(downsample_mode),
             )
-            B = reference_frames.shape[0]
+            B = candidate_frames.shape[0]
             windows = [{"batch_start": 0, "batch_end": B,
                         "frame_indices": list(range(B)),
                         "_flat": True, "_downsampled": True}]
@@ -2158,8 +2339,29 @@ class BeatDropSelectorEmbeddingNode:
         max_res = max(64, int(image_resolution))
         resized = []
         for i in range(B):
-            resized.append(self._resize_frame(reference_frames[i], max_res))
-        reference_frames = torch.stack(resized, dim=0)
+            resized.append(self._resize_frame(candidate_frames[i], max_res))
+        candidate_frames = torch.stack(resized, dim=0)
+
+        # Scene references are used only for pose/context matching. Bound and resize
+        # them independently so a full silent-video batch cannot exhaust Qwen VRAM.
+        if scene_reference_frames is not None:
+            scene_reference_frames, scene_windows = self._downsample_scene_references(
+                scene_reference_frames, scene_windows, max_frames=max_total,
+            )
+            scene_reference_frames = torch.stack([
+                self._resize_frame(scene_reference_frames[i], max_res)
+                for i in range(int(scene_reference_frames.shape[0]))
+            ], dim=0)
+        if scene_context_frames is not None:
+            if int(scene_context_frames.shape[0]) > max_total:
+                keep = torch.linspace(
+                    0, int(scene_context_frames.shape[0]) - 1, max_total
+                ).round().long()
+                scene_context_frames = scene_context_frames[keep]
+            scene_context_frames = torch.stack([
+                self._resize_frame(scene_context_frames[i], max_res)
+                for i in range(int(scene_context_frames.shape[0]))
+            ], dim=0)
 
         n_per_window = max(1, min(int(max_frames_per_window), B))
 
@@ -2173,10 +2375,7 @@ class BeatDropSelectorEmbeddingNode:
             extra_penalties = {}
 
         # ── num_outfits ──
-        if str(num_outfits_mode).strip() == "auto_from_beats":
-            num_outfits = max(2, len(windows))
-        else:
-            num_outfits = max(2, int(num_outfits))
+        num_outfits = required_outfit_states
         num_windows = len(windows)
         min_per_window = max(1, (num_outfits + num_windows - 1) // num_windows)
         n_per_window = max(n_per_window, min_per_window)
@@ -2213,7 +2412,7 @@ class BeatDropSelectorEmbeddingNode:
         if embedding_model is not None:
             try:
                 embedding_scores, stage1_info, embedding_conf = self._stage1_embedding_score(
-                    reference_frames, windows,
+                    candidate_frames, windows,
                     None, "auto", "fp16",  # not used when preloaded_model is set
                     embedding_scene_fit_weight, embedding_change_strength_weight,
                     embedding_diversity_weight,
@@ -2223,6 +2422,9 @@ class BeatDropSelectorEmbeddingNode:
                     phase_text_blend_weight=phase_text_blend_weight,
                     pair_constraints_json=json.dumps(pair_constraints),
                     cached_frame_embs=cached_frame_embs,
+                    scene_reference_frames=scene_reference_frames,
+                    scene_windows=scene_windows,
+                    scene_context_frames=scene_context_frames,
                 )
                 pair_frame_embs = stage1_info.pop("_frame_embs_internal", None)
                 stage_used = "embedding"
@@ -2304,7 +2506,7 @@ class BeatDropSelectorEmbeddingNode:
                 rr = self._run_reranker_transformers(
                     query=query,
                     documents=documents,
-                    document_images=reference_frames,
+                    document_images=candidate_frames,
                     top_n=max(top_k, B),
                     model_path=reranker_model_path,
                     device=reranker_device,
@@ -2439,10 +2641,10 @@ class BeatDropSelectorEmbeddingNode:
         # similar color. This can choose a slightly lower individual phase-0
         # candidate if it forms a better before/after pair.
         if pair_constraints and len(windows) >= 2 and n_per_window == 1:
-            color_sigs = [_color_signature(reference_frames[i]) for i in range(B)]
+            color_sigs = [_color_signature(candidate_frames[i]) for i in range(B)]
             frame_pils_for_pairs = None
             try:
-                frame_pils_for_pairs = _image_batch_to_pil_images(reference_frames)
+                frame_pils_for_pairs = _image_batch_to_pil_images(candidate_frames)
             except Exception:
                 frame_pils_for_pairs = None
 
@@ -2960,7 +3162,7 @@ class BeatDropSelectorEmbeddingNode:
                         score_lines.append(", ".join(parts))
 
                     # Build contact sheet from ONLY the top-K frames
-                    vlm_frames = reference_frames[torch.tensor(vlm_frame_indices, dtype=torch.long)]
+                    vlm_frames = candidate_frames[torch.tensor(vlm_frame_indices, dtype=torch.long)]
                     vlm_pils = _image_batch_to_pil_images(vlm_frames)
                     labels = [str(i + 1) for i in range(len(vlm_pils))]
                     cs_sheet = _build_contact_sheet(
@@ -3070,7 +3272,7 @@ class BeatDropSelectorEmbeddingNode:
         contact_sheet = _make_blank_image()
         if all_selected:
             try:
-                sel_tensor = reference_frames[torch.tensor(all_selected, dtype=torch.long)]
+                sel_tensor = candidate_frames[torch.tensor(all_selected, dtype=torch.long)]
                 sel_pils = _image_batch_to_pil_images(sel_tensor)
                 labels = [f"F{fidx}" for fidx in all_selected]
                 cs_pil = _build_contact_sheet(sel_pils, grid_columns, labels if add_id_labels else None)
@@ -3082,7 +3284,11 @@ class BeatDropSelectorEmbeddingNode:
         # ── Metadata ──
         meta = json.dumps({
             "mode": "embedding_3stage",
+            "candidate_source": candidate_source,
             "total_frames": B,
+            "total_candidates": B,
+            "scene_reference_frames": scene_count,
+            "scene_context_frames": int(scene_context_frames.shape[0]) if scene_context_frames is not None else 0,
             "windows_count": len(windows),
             "selected_total": len(all_selected),
             "num_outfits": num_outfits,
@@ -3137,7 +3343,8 @@ class BeatDropSelectorEmbeddingNode:
                 all_selected=all_selected,
                 window_results=window_results,
                 extra_instructions=extra_instructions,
-                reference_frames=reference_frames,
+                candidate_frames=candidate_frames,
+                scene_reference_frames=scene_reference_frames,
                 contact_sheet=contact_sheet,
                 candidate_folders=candidate_folders,
                 embedding_scores=embedding_scores,
@@ -3148,7 +3355,8 @@ class BeatDropSelectorEmbeddingNode:
         )
 
     def _build_ai_stack_context(self, conversation_id, stage_used, all_selected,
-                                  window_results, extra_instructions, reference_frames,
+                                  window_results, extra_instructions, candidate_frames,
+                                  scene_reference_frames,
                                   contact_sheet, candidate_folders, embedding_scores,
                                   reranker_scores, vlm_raw_responses, folder_info):
         """Build structured context for AlphaRavis AI Stack integration.
@@ -3167,6 +3375,8 @@ class BeatDropSelectorEmbeddingNode:
             "thread_id": str(conversation_id or "").strip(),
             "stage_used": stage_used,
             "timestamp": __import__("time").time(),
+            "candidate_count": int(candidate_frames.shape[0]) if candidate_frames is not None else 0,
+            "scene_reference_count": int(scene_reference_frames.shape[0]) if scene_reference_frames is not None else 0,
         }
 
         # ── Per-phase decisions ──
@@ -3244,20 +3454,33 @@ class BeatDropSelectorEmbeddingNode:
             except Exception:
                 pass
 
-        # Save individual selected frames
-        if reference_frames is not None and all_selected:
+        # Save selected OUTFIT candidates. Video references are never persisted as selections.
+        image_paths = folder_info.get("_image_paths", {}) if isinstance(folder_info, dict) else {}
+        image_stems = folder_info.get("_image_stems", {}) if isinstance(folder_info, dict) else {}
+        folder_list = folder_info.get("_folder_list", []) if isinstance(folder_info, dict) else []
+        if candidate_frames is not None and all_selected:
             for fidx in all_selected:
-                if 0 <= fidx < reference_frames.shape[0]:
-                    frame_path = sel_dir / f"frame_{fidx:04d}.png"
+                if 0 <= fidx < candidate_frames.shape[0]:
+                    frame_path = sel_dir / f"outfit_candidate_{fidx:04d}.png"
                     try:
-                        arr = (reference_frames[fidx].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
+                        arr = (candidate_frames[fidx].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
                         Image.fromarray(arr).save(str(frame_path))
-                        saved_files.append({
-                            "type": "selected_frame",
+                        saved = {
+                            "type": "selected_outfit_candidate",
                             "frame_index": fidx,
                             "path": str(frame_path),
                             "filename": frame_path.name,
-                        })
+                            "source_identity": self._candidate_source_identity(
+                                fidx, image_paths, candidate_frames,
+                            ),
+                        }
+                        if image_paths.get(fidx):
+                            saved["source_path"] = image_paths[fidx]
+                        if image_stems.get(fidx):
+                            saved["source_stem"] = image_stems[fidx]
+                        if fidx < len(folder_list):
+                            saved["source_folder"] = folder_list[fidx]
+                        saved_files.append(saved)
                     except Exception:
                         pass
 

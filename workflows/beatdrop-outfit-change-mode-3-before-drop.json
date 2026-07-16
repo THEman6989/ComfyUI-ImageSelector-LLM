@@ -1,0 +1,388 @@
+{
+  "1": {
+    "class_type": "BeatItNode",
+    "inputs": {
+      "fps": 30.0,
+      "audio_path": "",
+      "video": "SET_VIDEO_PATH.mp4",
+      "max_beats": 64
+    },
+    "_meta": {
+      "title": "BeatThis — Full Beat Timeline (max 64)"
+    }
+  },
+  "2": {
+    "class_type": "FrameSequenceGenerator",
+    "inputs": {
+      "video": "SET_VIDEO_PATH.mp4",
+      "base_url": "http://127.0.0.1:8188",
+      "filename_prefix": "beatdrop_mode_3_before_drop",
+      "fps": 30.0,
+      "window_seconds": 0.2,
+      "beats_json": [
+        "1",
+        0
+      ],
+      "drops_only": false,
+      "main_job_only": false,
+      "start_seconds": 0.0,
+      "end_seconds": 9.611,
+      "beat_selection_mode": "beats_before_drop",
+      "anchor_drop_strategy": "first_downbeat_drop",
+      "ignore_start_seconds": 1.0,
+      "max_beat_time_seconds": 9.611
+    },
+    "_meta": {
+      "title": "Mode 3 — Beats Before Drop"
+    }
+  },
+  "3": {
+    "class_type": "FrameSequenceGenerator",
+    "inputs": {
+      "video": "SET_VIDEO_PATH.mp4",
+      "base_url": "http://127.0.0.1:8188",
+      "filename_prefix": "beatdrop_mode_3_before_drop_context",
+      "fps": 1.0,
+      "window_seconds": 1.0,
+      "beats_json": "",
+      "drops_only": false,
+      "main_job_only": false,
+      "start_seconds": 0.0,
+      "end_seconds": 9.611
+    },
+    "_meta": {
+      "title": "Whole-Video Scene Context (1 FPS)"
+    }
+  },
+  "4": {
+    "class_type": "easy sam3ModelLoader",
+    "inputs": {
+      "model": "sam3.pt",
+      "segmentor": "image",
+      "device": "auto",
+      "precision": "fp16"
+    },
+    "_meta": {
+      "title": "SAM3 Character Segmentation Model"
+    }
+  },
+  "5": {
+    "class_type": "easy sam3ImageSegmentation",
+    "inputs": {
+      "sam3_model": [
+        "4",
+        0
+      ],
+      "images": [
+        "2",
+        0
+      ],
+      "prompt": "woman",
+      "threshold": 0.3,
+      "keep_model_loaded": false,
+      "add_background": "none",
+      "detection_limit": 1
+    },
+    "_meta": {
+      "title": "Track Person Through Drop Window"
+    }
+  },
+  "6": {
+    "class_type": "MaskQualityFilter",
+    "inputs": {
+      "masks": [
+        "5",
+        0
+      ],
+      "area_threshold": 64,
+      "mean_threshold": 0.001,
+      "max_area_fraction": 0.75,
+      "min_bbox_area": 64,
+      "max_centroid_jump_px": 160.0,
+      "max_area_jump_ratio": 5.0,
+      "mode": "zero_invalid",
+      "threshold": 0.5
+    },
+    "_meta": {
+      "title": "Mask Quality Report"
+    }
+  },
+  "7": {
+    "class_type": "MaskInterpolatorPro",
+    "inputs": {
+      "masks": [
+        "6",
+        0
+      ],
+      "images": [
+        "2",
+        0
+      ],
+      "invalid_frame_mask": [
+        "6",
+        1
+      ],
+      "beats_used": [
+        "2",
+        4
+      ],
+      "area_threshold": 64,
+      "mean_threshold": 0.001,
+      "method": "auto",
+      "post_blur_sigma": 0.8,
+      "threshold": 0.5,
+      "morph_radius": 1,
+      "max_gap": 24
+    },
+    "_meta": {
+      "title": "Repair Missing Masks"
+    }
+  },
+  "8": {
+    "class_type": "MaskCropStabilizer",
+    "inputs": {
+      "images": [
+        "2",
+        0
+      ],
+      "masks": [
+        "7",
+        0
+      ],
+      "output_size": 512,
+      "padding_percent": 0.3,
+      "smoothing": 0.8,
+      "square_crop": true,
+      "min_crop_size": 96,
+      "mask_mode": "image_crop",
+      "mask_threshold": 0.5,
+      "valid_area_threshold": 64,
+      "beats_used": [
+        "2",
+        4
+      ]
+    },
+    "_meta": {
+      "title": "Stable Character Crops"
+    }
+  },
+  "9": {
+    "class_type": "DINOv2FrameChangeDetector",
+    "inputs": {
+      "crops": [
+        "8",
+        0
+      ],
+      "mode": "auto",
+      "model_name": "dinov2_vitb14",
+      "device": "auto",
+      "change_threshold": 0.25,
+      "start_frame": 0,
+      "fps": 30.0,
+      "beat_frame": 6,
+      "beat_time_sec": 1.12,
+      "search_before_frames": 6,
+      "search_after_frames": 6,
+      "top_k": 5,
+      "alignment_offset_frames": 0,
+      "manual_offset_frames": 0
+    },
+    "_meta": {
+      "title": "DINOv2 Diagnostics Only — Audio Drives Multi-Beat Timing"
+    }
+  },
+  "10": {
+    "class_type": "QwenVLEmbeddingLoader",
+    "inputs": {
+      "model_path": "Qwen/Qwen3-VL-Embedding-8B",
+      "device": "auto",
+      "dtype": "fp16",
+      "keep_loaded": false
+    },
+    "_meta": {
+      "title": "Qwen Outfit Embedding Model (GPU 1)"
+    }
+  },
+  "11": {
+    "class_type": "BeatDropConfigPipe",
+    "inputs": {
+      "preset": "beatdrop_outfit_library_analysis",
+      "thread_id": "beatdrop-mode-3-example",
+      "max_frames_per_window": 1,
+      "max_candidate_images": 16,
+      "use_vlm_fallback": false
+    },
+    "_meta": {
+      "title": "AI-Stack Preference Boundary"
+    }
+  },
+  "12": {
+    "class_type": "BeatDropSelectorEmbeddingNode",
+    "inputs": {
+      "max_frames_per_window": 1,
+      "num_outfits_mode": "auto_from_beats",
+      "num_outfits": 2,
+      "embedding_model": [
+        "10",
+        0
+      ],
+      "reference_frames": [
+        "2",
+        0
+      ],
+      "context_frames": [
+        "3",
+        0
+      ],
+      "beats_used": [
+        "2",
+        4
+      ],
+      "embedding_confidence_threshold": 0.0,
+      "embedding_scene_fit_weight": 0.45,
+      "embedding_change_strength_weight": 0.35,
+      "embedding_diversity_weight": 0.2,
+      "reranker_mode": "api",
+      "reranker_endpoint": "",
+      "reranker_top_k": 12,
+      "reranker_blend_weight": 0.35,
+      "reranker_confidence_threshold": 0.7,
+      "use_vlm_fallback": false,
+      "max_total_frames": 128,
+      "job_fps": 5.0,
+      "context_fps": 1.0,
+      "downsample_mode": "global",
+      "image_resolution": 512,
+      "history_file": "beatdrop_cache/outfit_selection_history.json",
+      "history_penalty": 10.0,
+      "history_max_entries": 200,
+      "history_decay_rate": 0.3,
+      "conversation_id": "beatdrop-mode-3-example",
+      "grid_columns": 2,
+      "add_id_labels": true,
+      "candidate_folders": "SET_OUTFIT_LIBRARY_FOLDER",
+      "max_candidate_images": 16,
+      "use_random_sample": false,
+      "use_embedding_cache": true,
+      "cache_db_path": "beatdrop_cache/outfit_embeddings.sqlite",
+      "ai_stack_config_json": [
+        "11",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Separate Outfit Library Ranking"
+    }
+  },
+  "13": {
+    "class_type": "BeatDropPlanWriterPipe",
+    "inputs": {
+      "job_policy": "beats_before_drop",
+      "beats_json": [
+        "2",
+        4
+      ],
+      "change_detection_json": [
+        "9",
+        0
+      ],
+      "mask_quality_json": [
+        "6",
+        2
+      ],
+      "ai_stack_context": [
+        "12",
+        5
+      ],
+      "plan_id": "outfit_analysis_beatdrop_mode_3_before_drop"
+    },
+    "_meta": {
+      "title": "Persist Analysis Plan"
+    }
+  },
+  "14": {
+    "class_type": "SaveImage",
+    "inputs": {
+      "images": [
+        "12",
+        3
+      ],
+      "filename_prefix": "beatdrop_analysis/beatdrop_mode_3_before_drop_outfits"
+    },
+    "_meta": {
+      "title": "Save Selected Outfit Contact Sheet"
+    }
+  },
+  "16": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "13",
+        1
+      ]
+    },
+    "_meta": {
+      "title": "Plan JSON Output"
+    }
+  },
+  "17": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "13",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "Plan Path Output"
+    }
+  },
+  "18": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "12",
+        2
+      ]
+    },
+    "_meta": {
+      "title": "Selector Scores and Metadata"
+    }
+  },
+  "19": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "12",
+        5
+      ]
+    },
+    "_meta": {
+      "title": "AI Stack Context / Asset Paths"
+    }
+  },
+  "20": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "2",
+        4
+      ]
+    },
+    "_meta": {
+      "title": "Per-Frame Timestamp Metadata"
+    }
+  },
+  "21": {
+    "class_type": "PreviewAny",
+    "inputs": {
+      "source": [
+        "9",
+        0
+      ]
+    },
+    "_meta": {
+      "title": "DINOv2 Change Metadata"
+    }
+  }
+}

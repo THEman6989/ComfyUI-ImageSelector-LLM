@@ -11,6 +11,8 @@ Devices: cuda:0, cuda:1, cuda:2, cuda:3, cpu, auto
 Place in: ComfyUI-ImageSelector-LLM/qwen_vl_embedding_loader.py
 """
 
+import os
+from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -20,6 +22,29 @@ from PIL import Image
 # Shared cache — same as beatdrop_selector_embedding.py
 _QWEN_EMBEDDING_CACHE = {}
 _ALLOWED_EMBEDDING_MODELS = {"Qwen/Qwen3-VL-Embedding-8B"}
+
+
+def _resolve_embedding_repo():
+    """Resolve the trusted Qwen wrapper repo from durable then legacy locations."""
+    candidates = []
+    configured = str(os.environ.get("QWEN3_VL_EMBEDDING_REPO", "")).strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.extend([
+        Path.home() / "experi" / "krams" / "Qwen3-VL-Embedding",
+        Path("/tmp/Qwen3-VL-Embedding"),
+    ])
+    checked = []
+    for candidate in candidates:
+        repo = candidate.resolve()
+        expected = repo / "src" / "models" / "qwen3_vl_embedding.py"
+        checked.append(str(expected))
+        if expected.is_file():
+            return repo
+    raise RuntimeError(
+        "Required Qwen3-VL-Embedding wrapper not found. Checked: "
+        + ", ".join(checked)
+    )
 
 
 def _validate_model_path(model_path):
@@ -45,23 +70,25 @@ def _get_qwen_embedding_model(model_path, device, dtype_str):
     print(f"[QwenLoader] Loading: {model_path} | device={device} | dtype={dtype_str}")
 
     import sys as _sys
-    _embed_repo = Path("/tmp/Qwen3-VL-Embedding").resolve()
-    _expected = _embed_repo / "src" / "models" / "qwen3_vl_embedding.py"
-    if not _expected.is_file():
-        raise RuntimeError(
-            f"Required Qwen3-VL-Embedding wrapper not found at {_expected}. "
-            "Clone the trusted repo before loading the embedding node."
-        )
+    _embed_repo = _resolve_embedding_repo()
     if str(_embed_repo) not in _sys.path:
         _sys.path.insert(0, str(_embed_repo))
 
     torch_dtype = torch.float16 if dtype_str == "fp16" else torch.float32
 
     from src.models.qwen3_vl_embedding import Qwen3VLEmbedder
-    model = Qwen3VLEmbedder(
-        model_name_or_path=model_path,
-        torch_dtype=torch_dtype,
+    load_context = (
+        torch.cuda.device(device)
+        if str(device).startswith("cuda:") and torch.cuda.is_available()
+        else nullcontext()
     )
+    with load_context:
+        model = Qwen3VLEmbedder(
+            model_name_or_path=model_path,
+            torch_dtype=torch_dtype,
+        )
+    if str(device) == "cpu" and hasattr(model, "model"):
+        model.model.to("cpu")
     dim = 4096
 
     _QWEN_EMBEDDING_CACHE[cache_key] = (model, "qwen3vl_embedder", dim)

@@ -42,6 +42,146 @@ def _safe_child_dir(base, *parts):
     return out
 
 
+def _first_audio_drop(beats):
+    if not isinstance(beats, list) or not beats:
+        return None
+    return next((beat for beat in beats if beat.get("is_drop")), beats[0])
+
+
+def _frame_mapping(beat, local_batch_index):
+    for frame in beat.get("frames", []) if isinstance(beat, dict) else []:
+        if int(frame.get("batch_index", -1)) == int(local_batch_index):
+            return frame
+    return None
+
+
+def _build_drop_decision(beats, change_detection, force_audio=False):
+    """Choose DINO only for a detected visual outfit change; otherwise use audio."""
+    beat = _first_audio_drop(beats)
+    if beat is None:
+        return None
+
+    change = change_detection if isinstance(change_detection, dict) else {}
+    has_visual_change = bool(change.get("has_existing_visual_change")) and not bool(force_audio)
+    raw_best_change = change.get("best_change")
+    best_change = raw_best_change if isinstance(raw_best_change, dict) else {}
+    if has_visual_change and best_change.get("to_frame") is not None:
+        local_index = int(best_change["to_frame"])
+        mapped = _frame_mapping(beat, local_index)
+        return {
+            "source": "dinov2_visual_change",
+            "dino_used": True,
+            "source_frame_index": int(
+                mapped.get("source_frame_index", local_index) if mapped else local_index
+            ),
+            "time_seconds": float(
+                mapped.get("time_seconds", beat.get("time_seconds", 0.0))
+                if mapped else beat.get("time_seconds", 0.0)
+            ),
+            "local_batch_index": local_index,
+            "needs_generated_outfit_drop": bool(change.get("needs_generated_outfit_drop", False)),
+        }
+
+    local_index = int(change.get("beat_frame", beat.get("batch_offset", 0)))
+    return {
+        "source": "audio_beat",
+        "dino_used": False,
+        "source_frame_index": int(beat.get("frame_index", 0)),
+        "time_seconds": float(beat.get("time_seconds", 0.0)),
+        "local_batch_index": local_index,
+        "needs_generated_outfit_drop": bool(change.get("needs_generated_outfit_drop", True)),
+    }
+
+
+def _build_beat_decisions(beats):
+    """Create one deterministic audio transition for every selected beat window."""
+    if not isinstance(beats, list):
+        return []
+    decisions = []
+    for transition_index, beat in enumerate(beat for beat in beats if isinstance(beat, dict)):
+        source_frame = int(beat.get("frame_index", 0))
+        frames = [frame for frame in beat.get("frames", []) if isinstance(frame, dict)]
+        mapped = min(
+            frames,
+            key=lambda frame: abs(int(frame.get("source_frame_index", source_frame)) - source_frame),
+        ) if frames else None
+        decisions.append({
+            "transition_index": transition_index,
+            "outfit_state_before": transition_index,
+            "outfit_state_after": transition_index + 1,
+            "source": "audio_beat",
+            "dino_used": False,
+            "source_frame_index": source_frame,
+            "time_seconds": float(beat.get("time_seconds", 0.0)),
+            "local_batch_index": int(
+                mapped.get("batch_index", beat.get("batch_offset", 0))
+                if mapped else beat.get("batch_offset", 0)
+            ),
+            "selection_mode": str(beat.get("selection_mode", "legacy")),
+            "relative_to_anchor": beat.get("relative_to_anchor"),
+            "anchor_drop_time_seconds": beat.get("anchor_drop_time_seconds"),
+            "needs_generated_outfit_drop": True,
+        })
+    return decisions
+
+
+def _build_outfit_state_plan(beat_decisions, selection):
+    """Map N transitions to N+1 outfit states, cycling a smaller library safely."""
+    if not beat_decisions or not isinstance(selection, dict):
+        return []
+    saved_by_frame = {}
+    for item in selection.get("saved_files", []):
+        if isinstance(item, dict) and item.get("frame_index") is not None:
+            try:
+                saved_by_frame[int(item["frame_index"])] = item
+            except (TypeError, ValueError):
+                pass
+
+    candidates = []
+    seen_identities = set()
+    for phase in selection.get("phase_decisions", []):
+        if not isinstance(phase, dict):
+            continue
+        for frame in phase.get("selected_frames", []):
+            try:
+                frame = int(frame)
+            except (TypeError, ValueError):
+                continue
+            saved = saved_by_frame.get(frame, {})
+            identity = str(
+                saved.get("source_identity")
+                or saved.get("source_path")
+                or f"frame:{frame}"
+            )
+            if identity not in seen_identities:
+                candidates.append({"frame": frame, "identity": identity, "saved": saved})
+                seen_identities.add(identity)
+    if not candidates:
+        return []
+    if len(candidates) < 2:
+        raise ValueError(
+            "BeatDrop transitions require at least two unique outfit candidates; "
+            "duplicate batch copies do not count as distinct outfits."
+        )
+
+    state_plan = []
+    for state_index in range(len(beat_decisions) + 1):
+        candidate = candidates[state_index % len(candidates)]
+        candidate_frame = candidate["frame"]
+        state = {
+            "outfit_state": state_index,
+            "candidate_frame": candidate_frame,
+            "source_identity": candidate["identity"],
+            "reused_candidate": state_index >= len(candidates),
+        }
+        saved = candidate["saved"]
+        if saved:
+            state["candidate_path"] = saved.get("path", "")
+            state["source_path"] = saved.get("source_path", "")
+        state_plan.append(state)
+    return state_plan
+
+
 class BeatDropPlanWriterPipe:
     """Consolidates pipeline outputs → drop_plan.json.
 
@@ -54,7 +194,7 @@ class BeatDropPlanWriterPipe:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "job_policy": (["main_job_only", "drops_only", "all_frames"], {
+                "job_policy": (["main_job_only", "drops_only", "all_frames", "beats_before_drop", "beats_after_drop"], {
                     "default": "drops_only",
                     "tooltip": "Which frames to render.",
                 }),
@@ -144,6 +284,7 @@ class BeatDropPlanWriterPipe:
             plan["selection"] = selection
 
         # ── Merge pipeline outputs ──
+        parsed_outputs = {}
         for key, source in [
             ("beats", beats_json),
             ("change_detection", change_detection_json),
@@ -152,9 +293,35 @@ class BeatDropPlanWriterPipe:
         ]:
             if source and str(source).strip() not in ("", "{}"):
                 try:
-                    plan[key] = json.loads(source)
+                    parsed_outputs[key] = json.loads(source)
                 except (json.JSONDecodeError, TypeError):
                     plan[f"{key}_raw"] = str(source)[:10000]
+
+        beats = parsed_outputs.get("beats", [])
+        change_detection = parsed_outputs.get("change_detection", {})
+        multi_beat_mode = str(job_policy) in {"beats_before_drop", "beats_after_drop"}
+        if isinstance(change_detection, dict):
+            change_detection["ignored_for_drop_decision"] = multi_beat_mode or not bool(
+                change_detection.get("has_existing_visual_change")
+            )
+        plan.update(parsed_outputs)
+        drop_decision = _build_drop_decision(
+            beats, change_detection, force_audio=multi_beat_mode,
+        )
+        if drop_decision is not None:
+            plan["drop_decision"] = drop_decision
+        beat_decisions = _build_beat_decisions(beats)
+        if beat_decisions:
+            plan["beat_decisions"] = beat_decisions
+            plan["required_outfit_states"] = len(beat_decisions) + 1
+            outfit_state_plan = _build_outfit_state_plan(beat_decisions, selection)
+            if outfit_state_plan:
+                plan["outfit_state_plan"] = outfit_state_plan
+                for decision in beat_decisions:
+                    before = outfit_state_plan[decision["outfit_state_before"]]
+                    after = outfit_state_plan[decision["outfit_state_after"]]
+                    decision["outfit_candidate_before"] = before["candidate_frame"]
+                    decision["outfit_candidate_after"] = after["candidate_frame"]
 
         # ── Serialize ──
         plan_json = json.dumps(plan, indent=2, ensure_ascii=False)
